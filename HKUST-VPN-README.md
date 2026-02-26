@@ -74,7 +74,7 @@ ssh szhangfa@superpod.ust.hk
 ```
 用法: hkust-vpn.py [-h] [-u USER] [--proxy PROXY] [--no-proxy]
                     [--hosts HOSTS [HOSTS ...]] [--cookie COOKIE]
-                    [--setup] [--headless]
+                    [--setup] [--headless] [--no-reconnect]
 
 参数:
   -u, --user USER       ITSC 账号 (默认: szhangfa@connect.ust.hk)
@@ -121,12 +121,13 @@ HKUST VPN 有以下时间限制：
 
 默认自动重连，过期后自动重新登录并重连，无需手动操作。使用 `--no-reconnect` 可禁用。
 
+如果检测到已有 session，脚本会自动点击 "Continue the session" 踢掉旧 session。
+
 ## 文件说明
 
 ```
 ~/wkspace/stuffs/hkust-vpn.py           # 主脚本
 ~/.config/hkust-vpn/credentials.json     # 凭据存储 (chmod 600)
-~/.claude/skills/ssh-remote/SKILL.md     # Claude Code SSH skill
 ```
 
 ## 工作流程
@@ -155,7 +156,7 @@ HKUST VPN 有以下时间限制：
 
 ### 登录失败
 
-调试截图自动保存在 `/tmp/hkust-vpn-debug-*.png`，查看具体卡在哪一步。
+遇到问题时可临时在脚本中加 `page.screenshot()` 调试，或使用非 headless 模式观察浏览器行为。
 
 ### vpn-slice not found
 
