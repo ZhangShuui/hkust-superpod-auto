@@ -182,6 +182,30 @@ date
 sudo ntpdate pool.ntp.org
 ```
 
+## 搭配 Claude Code 使用
+
+VPN 连上后，推荐使用 [mcp-interactive-terminal](https://github.com/amol21p/mcp-interactive-terminal) 维护持久交互式终端，特别适合 SLURM 集群的 `srun` 交互式会话。
+
+### 安装
+
+```bash
+claude mcp add terminal --scope user -- npx -y mcp-interactive-terminal
+```
+
+### 工作流
+
+```
+1. VPN 连接                    python3 hkust-vpn.py
+2. 创建 SSH session            create_session → ssh szhangfa@superpod.ust.hk
+3. 申请 GPU 节点               send_command → srun --gres=gpu:1 --pty bash
+4. 在计算节点上执行命令         send_command → cd /data && python train.py
+5. 所有命令在同一个 srun session 中，环境/工作目录全保持
+```
+
+### 为什么需要这个
+
+Claude Code 的 Bash 工具每次执行都是独立进程，无法维护持久 shell。而 SLURM 的 `srun --pty bash` 需要交互式会话，`sbatch` 每次要排队。mcp-interactive-terminal 通过 MCP 协议提供持久 PTY 终端，完美解决这个问题。
+
 ## 安全注意事项
 
 - 凭据文件权限为 600，仅本人可读
