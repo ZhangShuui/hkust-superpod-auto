@@ -14,6 +14,10 @@ import json
 import time
 from pathlib import Path
 
+import socket
+import struct
+import threading
+
 import pyotp
 from playwright.sync_api import sync_playwright
 
@@ -132,45 +136,70 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             print("[*] Step 3/5: Switching to TOTP...")
             page.wait_for_timeout(3000)
 
-            # If we still land on FIDO2 page somehow, click Back first
-            try:
-                back = page.locator("#idBtn_Back")
-                if back.is_visible(timeout=2000):
-                    print("[*]  -> Clicking 'Back' to exit FIDO2...")
-                    back.click()
-                    page.wait_for_timeout(3000)
-            except Exception:
-                pass
+            # Try to find "Use a verification code" — with retries and Back fallback
+            found = 'not_found'
+            for attempt in range(3):
+                found = page.evaluate("""() => {
+                    const els = document.querySelectorAll('div, a, button, li, span, p');
+                    for (const el of els) {
+                        const direct = [...el.childNodes]
+                            .filter(n => n.nodeType === 3)
+                            .map(n => n.textContent.trim())
+                            .join(' ');
+                        if (direct.includes('Use a verification code')) {
+                            const clickable = el.closest('[data-value], [role=button], a, button') || el;
+                            clickable.click();
+                            return 'found_direct';
+                        }
+                    }
+                    for (const el of els) {
+                        if (el.textContent?.includes('verification code') &&
+                            !el.textContent?.includes('Approve') &&
+                            el.offsetParent !== null &&
+                            el.children.length < 5) {
+                            el.click();
+                            return 'found_fallback';
+                        }
+                    }
+                    return 'not_found';
+                }""")
+                print(f"[*]  -> Attempt {attempt+1}: click result = {found}")
+                if found != 'not_found':
+                    break
 
-            # Click "Use a verification code"
-            print("[*]  -> Looking for 'Use a verification code'...")
-            page.evaluate("""() => {
-                const els = document.querySelectorAll('div, a, button, li, span, p');
-                for (const el of els) {
-                    const direct = [...el.childNodes]
-                        .filter(n => n.nodeType === 3)
-                        .map(n => n.textContent.trim())
-                        .join(' ');
-                    if (direct.includes('Use a verification code')) {
-                        // Click the element or its closest clickable parent
-                        const clickable = el.closest('[data-value], [role=button], a, button') || el;
-                        clickable.click();
-                        return;
+                # Not found — try clicking "I can't use my Microsoft Authenticator app right now"
+                alt = page.evaluate("""() => {
+                    const els = document.querySelectorAll('a, div, span, p, button');
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (t.includes("can't use") || t.includes('other way') ||
+                            t.includes('Sign in another way') || t.includes('different method')) {
+                            el.click();
+                            return t.substring(0, 60);
+                        }
                     }
-                }
-                // Fallback: broader match
-                for (const el of els) {
-                    if (el.textContent?.includes('verification code') &&
-                        !el.textContent?.includes('Approve') &&
-                        el.offsetParent !== null &&
-                        el.children.length < 5) {
-                        el.click();
-                        return;
-                    }
-                }
-            }""")
+                    return null;
+                }""")
+                if alt:
+                    print(f"[*]  -> Clicked alt link: '{alt}'")
+                    page.wait_for_timeout(3000)
+                    continue
+
+                # Try Back button as last resort
+                try:
+                    back = page.locator("#idBtn_Back")
+                    if back.is_visible(timeout=1000):
+                        print("[*]  -> Clicking 'Back' to exit FIDO2...")
+                        back.click()
+                        page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
             page.wait_for_timeout(3000)
-            print("[+] Clicked 'Use a verification code'.")
+            if found != 'not_found':
+                print("[+] Clicked 'Use a verification code'.")
+            else:
+                print("[!] Could not find 'Use a verification code', proceeding anyway...")
 
             # ── Step 4: Enter TOTP code ──
             print("[*] Step 4/5: Entering TOTP code...")
@@ -197,8 +226,31 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             # ── Wait for DSID cookie ──
             print("[*] Waiting for VPN session cookie...")
             dsid = None
-            for _ in range(120):
+            session_confirmed = False
+            for i in range(120):
                 page.wait_for_timeout(1000)
+
+                # Handle "other user sessions in progress" confirmation page
+                if not session_confirmed and ("user-confirm" in page.url or "user%2Dconfirm" in page.url):
+                    try:
+                        clicked = page.evaluate("""() => {
+                            const els = document.querySelectorAll('input[type=submit], button, a');
+                            for (const el of els) {
+                                const txt = (el.value || el.textContent || '').trim();
+                                if (txt.includes('Continue')) {
+                                    el.click();
+                                    return txt;
+                                }
+                            }
+                            return null;
+                        }""")
+                        if clicked:
+                            print(f"[*] Existing session detected, clicked '{clicked}'")
+                            page.wait_for_timeout(3000)
+                            session_confirmed = True
+                    except Exception:
+                        pass
+
                 cookies = context.cookies("https://remote.ust.hk")
                 for cookie in cookies:
                     if cookie["name"] == "DSID":
@@ -206,6 +258,8 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                         break
                 if dsid:
                     break
+                if i % 10 == 9:
+                    print(f"[*]  ... still waiting ({i+1}s)")
 
         except Exception as e:
             print(f"[!] Automated login error: {e}")
@@ -236,6 +290,62 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
 # ─── VPN Connection ───────────────────────────────────────────────────
 
+def dns_query_udp(hostname, dns_server, timeout=5):
+    """Resolve hostname via a specific DNS server using raw UDP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        qname = b''
+        for part in hostname.split('.'):
+            qname += bytes([len(part)]) + part.encode()
+        qname += b'\x00'
+        query = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0) + qname + struct.pack('>HH', 1, 1)
+        s.sendto(query, (dns_server, 53))
+        data, _ = s.recvfrom(512)
+        offset = 12
+        while data[offset] != 0:
+            offset += data[offset] + 1
+        offset += 5
+        if len(data) > offset + 12:
+            offset += 2 + 8
+            offset += 2
+            return '.'.join(str(b) for b in data[offset:offset+4])
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=10):
+    """Resolve hosts via VPN DNS and add /etc/hosts entries + routes.
+
+    vpn-slice can't resolve correctly when Clash intercepts DNS, so we
+    do it manually after the tunnel is up.
+    """
+    for attempt in range(retries):
+        time.sleep(3)
+        for host in hosts:
+            ip = dns_query_udp(host, vpn_dns)
+            if ip:
+                marker = f"# hkust-vpn {host}"
+                # Add /etc/hosts entry
+                cmd_hosts = f"grep -q '{marker}' /etc/hosts || echo '{ip} {host}  {marker}' >> /etc/hosts"
+                # Update if IP changed
+                cmd_update = f"sed -i '/{marker}/c\\{ip} {host}  {marker}' /etc/hosts"
+                # Add route through tun0
+                cmd_route = f"ip route replace {ip}/32 dev tun0"
+                full_cmd = f"{cmd_hosts} && {cmd_update} && {cmd_route}"
+                proc = subprocess.run(
+                    ["sudo", "-S", "bash", "-c", full_cmd],
+                    input=(sudo_password + "\n").encode(),
+                    capture_output=True,
+                )
+                print(f"[+] DNS fix: {host} -> {ip} (route via tun0)")
+                return True
+    print("[!] DNS fix: could not resolve hosts via VPN DNS")
+    return False
+
+
 def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
     """Launch openconnect with the DSID cookie and vpn-slice."""
     hosts = hosts or DEFAULT_HOSTS
@@ -265,6 +375,15 @@ def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
         if sudo_password:
             proc.stdin.write((sudo_password + "\n").encode())
             proc.stdin.flush()
+
+        # Fix DNS in background after tunnel comes up
+        dns_thread = threading.Thread(
+            target=fix_vpn_dns,
+            args=(hosts, sudo_password),
+            daemon=True,
+        )
+        dns_thread.start()
+
         proc.wait()
     except KeyboardInterrupt:
         print("\n[*] VPN disconnected.")
