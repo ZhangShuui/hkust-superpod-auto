@@ -33,6 +33,13 @@ def _load_dotenv():
             continue
         key, _, value = line.partition("=")
         key, value = key.strip(), value.strip()
+        # Strip inline comments (outside quotes)
+        if not (len(value) >= 2 and value[0] in ('"', "'") and value[0] == value[-1]):
+            if "#" in value:
+                value = value.split("#")[0].rstrip()
+        # Strip matching quotes
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
         if key and key not in os.environ:  # don't override existing env
             os.environ[key] = value
 

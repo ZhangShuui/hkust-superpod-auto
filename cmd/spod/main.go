@@ -49,6 +49,17 @@ func init() {
 				continue
 			}
 			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			// Strip inline comments (outside quotes)
+			quoted := len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[0] == v[len(v)-1]
+			if !quoted {
+				if i := strings.Index(v, "#"); i >= 0 {
+					v = strings.TrimSpace(v[:i])
+				}
+			}
+			// Strip matching quotes
+			if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[0] == v[len(v)-1] {
+				v = v[1 : len(v)-1]
+			}
 			if k != "" && os.Getenv(k) == "" {
 				os.Setenv(k, v)
 			}
@@ -62,7 +73,14 @@ func init() {
 }
 
 func findDotenv() string {
-	// Try cwd, then walk up to find .env
+	// 1. Try well-known config path
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".config", "spod", ".env")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// 2. Try cwd, then walk up
 	dir, _ := os.Getwd()
 	for i := 0; i < 5 && dir != "/"; i++ {
 		p := filepath.Join(dir, ".env")

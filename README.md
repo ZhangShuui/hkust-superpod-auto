@@ -57,7 +57,11 @@ sudo apt install openconnect autossh
 # 4. 编译安装 spod CLI
 cd cmd/spod && go build -o spod . && cp spod ~/.local/bin/ && cd ../..
 
-# 5. 配置 SSH (~/.ssh/config)
+# 5. 配置环境变量
+cp .env.example .env
+# 编辑 .env，填入你的 ITSC ID 等信息
+
+# 6. 配置 SSH (~/.ssh/config)
 cat >> ~/.ssh/config << 'EOF'
 Host superpod
     HostName superpod.ust.hk
@@ -67,10 +71,10 @@ Host superpod
     TCPKeepAlive yes
 EOF
 
-# 6. 首次 VPN 登录（输入 ITSC 账号、密码、TOTP 密钥）
-python3 hkust-vpn.py -u <your-itsc-id>@connect.ust.hk --setup
+# 7. 首次 VPN 登录（输入密码、TOTP 密钥）
+python3 hkust-vpn.py --setup
 
-# 7. 配置 SuperPod 上的 Claude Code 环境（见下方「SuperPod 环境配置」）
+# 8. 配置 SuperPod 上的 Claude Code 环境（见下方「SuperPod 环境配置」）
 ```
 
 ### 日常使用
