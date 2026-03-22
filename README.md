@@ -193,6 +193,7 @@ spod ls
 │   ├── main.go
 │   └── go.mod
 ├── hkust-vpn.py        # VPN 自动连接脚本
+├── .env.example        # 配置模板
 ├── sync.sh             # SuperPod 文件同步
 ├── speedtest.sh        # VPN 测速
 ├── HKUST-VPN-README.md
