@@ -23,10 +23,13 @@ from playwright.sync_api import sync_playwright
 
 
 VPN_URL = "https://remote.ust.hk/mfa"
-DEFAULT_USER = "<itsc-id>@connect.ust.hk"
+DEFAULT_USER = os.environ.get("HKUST_USER", "")
 DEFAULT_PROXY = "http://127.0.0.1:7897"
 DEFAULT_HOSTS = ["superpod.ust.hk"]
-VPN_SLICE_PATH = "/home/shurui/wkspace/hkust-superpod-auto/.venv/bin/vpn-slice"
+VPN_SLICE_PATH = os.environ.get(
+    "VPN_SLICE_PATH",
+    str(Path(__file__).resolve().parent / ".venv" / "bin" / "vpn-slice"),
+)
 CRED_FILE = Path.home() / ".config" / "hkust-vpn" / "credentials.json"
 
 
@@ -464,6 +467,10 @@ def main():
 
     # Load or setup credentials
     creds = load_credentials()
+    if not args.user:
+        args.user = creds.get("user", "")
+    if not args.user:
+        args.user = input("[?] ITSC account (e.g. user@connect.ust.hk): ").strip()
     if args.setup or not creds.get("password") or not creds.get("totp_secret"):
         password, totp_secret, sudo_password = setup_credentials(args.user)
     else:

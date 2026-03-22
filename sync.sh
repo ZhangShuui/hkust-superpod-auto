@@ -4,7 +4,8 @@
 
 set -e
 
-SRC="<itsc-id>@superpod.ust.hk:/project/hdtaccuracy/trains"
+USER="${SUPERPOD_USER:?Set SUPERPOD_USER (e.g. export SUPERPOD_USER=youruser)}"
+SRC="$USER@superpod.ust.hk:/project/hdtaccuracy/trains"
 DST="/mnt/e/hdtaccuracy/trains/"
 
 # 先杀掉已有的 rsync
@@ -20,7 +21,7 @@ done
 
 # trains_big5
 rsync -rlP --partial --inplace --no-times --no-perms \
-  <itsc-id>@superpod.ust.hk:/project/hdtaccuracy/trains_big5 /mnt/e/hdtaccuracy/ 2>/dev/null &
+  "$USER@superpod.ust.hk:/project/hdtaccuracy/trains_big5" /mnt/e/hdtaccuracy/ 2>/dev/null &
 
 sleep 3
 COUNT=$(ps aux | grep "rsync -rlP" | grep -v grep | wc -l)

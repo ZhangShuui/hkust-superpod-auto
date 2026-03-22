@@ -47,7 +47,7 @@ sudo playwright install-deps chromium
 ### 首次运行
 
 ```bash
-python3 ~/wkspace/stuffs/hkust-vpn.py --setup
+python3 hkust-vpn.py --setup
 ```
 
 按提示输入：
@@ -61,10 +61,10 @@ python3 ~/wkspace/stuffs/hkust-vpn.py --setup
 
 ```bash
 # 一键连接（默认开启自动重连，session 过期后自动重新登录）
-python3 ~/wkspace/stuffs/hkust-vpn.py
+python3 hkust-vpn.py
 
 # 连上后 VPN 进程会在前台运行，另开终端操作：
-ssh <itsc-id>@superpod.ust.hk
+ssh <your-itsc-id>@superpod.ust.hk
 
 # 断开 VPN：在 hkust-vpn.py 所在终端按 Ctrl+C（按两次彻底退出）
 ```
@@ -77,7 +77,7 @@ ssh <itsc-id>@superpod.ust.hk
                     [--setup] [--headless] [--no-reconnect]
 
 参数:
-  -u, --user USER       ITSC 账号 (默认: <itsc-id>@connect.ust.hk)
+  -u, --user USER       ITSC 账号 (默认: <your-itsc-id>@connect.ust.hk)
   --proxy PROXY         HTTP 代理 (默认: http://127.0.0.1:7890)
   --no-proxy            不使用代理
   --hosts HOSTS         走 VPN 的主机列表 (默认: superpod.ust.hk)
@@ -126,7 +126,7 @@ HKUST VPN 有以下时间限制：
 ## 文件说明
 
 ```
-~/wkspace/stuffs/hkust-vpn.py           # 主脚本
+hkust-vpn.py           # 主脚本
 ~/.config/hkust-vpn/credentials.json     # 凭据存储 (chmod 600)
 ```
 
@@ -160,7 +160,7 @@ HKUST VPN 有以下时间限制：
 
 ### vpn-slice not found
 
-脚本已硬编码路径 `/home/shurui/anaconda3/bin/vpn-slice`。如果 anaconda 路径变了，修改脚本中的 `VPN_SLICE_PATH`。
+脚本默认从项目 `.venv/bin/vpn-slice` 查找。如果路径不同，设置环境变量 `VPN_SLICE_PATH=/path/to/vpn-slice`。
 
 ### 连接超时
 
@@ -196,7 +196,7 @@ claude mcp add terminal --scope user -- npx -y mcp-interactive-terminal
 
 ```
 1. VPN 连接                    python3 hkust-vpn.py
-2. 创建 SSH session            create_session → ssh <itsc-id>@superpod.ust.hk
+2. 创建 SSH session            create_session → ssh <your-itsc-id>@superpod.ust.hk
 3. 申请 GPU 节点               send_command → srun --gres=gpu:1 --pty bash
 4. 在计算节点上执行命令         send_command → cd /data && python train.py
 5. 所有命令在同一个 srun session 中，环境/工作目录全保持

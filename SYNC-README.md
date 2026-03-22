@@ -6,7 +6,7 @@
 
 - VPN 已连接：`uv run python hkust-vpn.py`
 - E 盘已挂载：`sudo mkdir -p /mnt/e && sudo mount -t drvfs E: /mnt/e`
-- SSH 免密登录已配置：`ssh-copy-id <itsc-id>@superpod.ust.hk`
+- SSH 免密登录已配置：`ssh-copy-id <your-itsc-id>@superpod.ust.hk`
 
 ## 同步脚本
 

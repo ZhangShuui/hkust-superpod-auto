@@ -40,14 +40,49 @@ SuperPod SLURM 容器化 GPU 会话管理指南（Claude Code + MCP 交互式终
 
 ## Quick Start
 
+### 首次设置
+
 ```bash
-# 1. 启动 VPN
+# 1. 克隆项目
+git clone https://github.com/ZhangShuui/hkust-superpod-auto.git
+cd hkust-superpod-auto
+
+# 2. 安装 Python 依赖
+pip install pyotp playwright vpn-slice
+playwright install chromium
+
+# 3. 安装系统依赖
+sudo apt install openconnect autossh
+
+# 4. 编译安装 spod CLI
+cd cmd/spod && go build -o spod . && cp spod ~/.local/bin/ && cd ../..
+
+# 5. 配置 SSH (~/.ssh/config)
+cat >> ~/.ssh/config << 'EOF'
+Host superpod
+    HostName superpod.ust.hk
+    User <your-itsc-id>
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+    TCPKeepAlive yes
+EOF
+
+# 6. 首次 VPN 登录（输入 ITSC 账号、密码、TOTP 密钥）
+python3 hkust-vpn.py -u <your-itsc-id>@connect.ust.hk --setup
+
+# 7. 配置 SuperPod 上的 Claude Code 环境（见下方「SuperPod 环境配置」）
+```
+
+### 日常使用
+
+```bash
+# 终端 1：启动 VPN（挂着不动）
 python3 hkust-vpn.py
 
-# 2. 一键连接 SuperPod（自动建隧道 + tmux 会话）
+# 终端 2：一键连接 SuperPod
 spod
 
-# 3. 在 SuperPod 上使用 Claude Code
+# SuperPod 上运行 Claude Code
 claude
 ```
 
@@ -121,7 +156,7 @@ EOF
 ```
 Host superpod
     HostName superpod.ust.hk
-    User szhangfa
+    User <your-itsc-id>
     ServerAliveInterval 15
     ServerAliveCountMax 4
     TCPKeepAlive yes
