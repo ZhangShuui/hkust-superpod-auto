@@ -2,3 +2,9 @@
 *.png
 __pycache__/
 *.pyc
+.venv/
+.python-version
+uv.lock
+
+# Go build output
+cmd/spod/spod

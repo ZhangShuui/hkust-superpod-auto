@@ -24,9 +24,9 @@ from playwright.sync_api import sync_playwright
 
 VPN_URL = "https://remote.ust.hk/mfa"
 DEFAULT_USER = "<itsc-id>@connect.ust.hk"
-DEFAULT_PROXY = "http://127.0.0.1:7890"
+DEFAULT_PROXY = "http://127.0.0.1:7897"
 DEFAULT_HOSTS = ["superpod.ust.hk"]
-VPN_SLICE_PATH = "/home/shurui/anaconda3/bin/vpn-slice"
+VPN_SLICE_PATH = "/home/shurui/wkspace/hkust-superpod-auto/.venv/bin/vpn-slice"
 CRED_FILE = Path.home() / ".config" / "hkust-vpn" / "credentials.json"
 
 
