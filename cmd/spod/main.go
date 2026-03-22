@@ -22,22 +22,26 @@ const (
 	prefix     = "spod"
 )
 
-// ── Colors ──
+// ── Colors (256-color) ──
 
 const (
-	cyan   = "\033[0;36m"
-	green  = "\033[0;32m"
-	yellow = "\033[0;33m"
-	red    = "\033[0;31m"
-	bold   = "\033[1m"
-	dim    = "\033[2m"
-	reset  = "\033[0m"
+	// 主色调
+	cBlue   = "\033[38;5;75m"  // 亮蓝 — 信息
+	cGreen  = "\033[38;5;114m" // 柔绿 — 成功
+	cAmber  = "\033[38;5;221m" // 琥珀 — 警告
+	cRed    = "\033[38;5;203m" // 珊瑚红 — 错误
+	cPurple = "\033[38;5;141m" // 淡紫 — 强调
+	cGray   = "\033[38;5;243m" // 灰 — 次要信息
+	// 样式
+	bold  = "\033[1m"
+	dim   = "\033[2m"
+	reset = "\033[0m"
 )
 
-func info(msg string) { fmt.Fprintf(os.Stderr, "%s[*]%s %s\n", cyan, reset, msg) }
-func ok(msg string)   { fmt.Fprintf(os.Stderr, "%s[+]%s %s\n", green, reset, msg) }
-func warn(msg string) { fmt.Fprintf(os.Stderr, "%s[!]%s %s\n", yellow, reset, msg) }
-func fail(msg string) { fmt.Fprintf(os.Stderr, "%s[-]%s %s\n", red, reset, msg) }
+func info(msg string) { fmt.Fprintf(os.Stderr, "  %s›%s %s\n", cBlue, reset, msg) }
+func ok(msg string)   { fmt.Fprintf(os.Stderr, "  %s✓%s %s\n", cGreen, reset, msg) }
+func warn(msg string) { fmt.Fprintf(os.Stderr, "  %s⚠%s %s\n", cAmber, reset, msg) }
+func fail(msg string) { fmt.Fprintf(os.Stderr, "  %s✗%s %s\n", cRed, reset, msg) }
 
 // ── Validation ──
 
@@ -279,15 +283,19 @@ func fullName(name string) string {
 }
 
 func printSessions(sessions []session) {
-	fmt.Fprintf(os.Stderr, "\n%s  会话列表%s\n", bold, reset)
-	fmt.Fprintf(os.Stderr, "  ─────────────────────────────\n")
+	fmt.Fprintf(os.Stderr, "\n  %s%sSuperPod Sessions%s\n", bold, cPurple, reset)
+	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
 	for i, s := range sessions {
-		status := fmt.Sprintf("%s○ detached%s", yellow, reset)
+		var icon, status string
 		if s.attached {
-			status = fmt.Sprintf("%s● attached%s", green, reset)
+			icon = fmt.Sprintf("%s●%s", cGreen, reset)
+			status = fmt.Sprintf("%sattached%s", cGreen, reset)
+		} else {
+			icon = fmt.Sprintf("%s○%s", cGray, reset)
+			status = fmt.Sprintf("%sdetached%s", cGray, reset)
 		}
-		fmt.Fprintf(os.Stderr, "  %s%d)%s %-20s %s  %s(%s win)%s\n",
-			bold, i+1, reset, s.name, status, dim, s.windows, reset)
+		fmt.Fprintf(os.Stderr, "  %s%d)%s %s %-18s %s  %s%s win%s\n",
+			cBlue, i+1, reset, icon, s.name, status, cGray, s.windows, reset)
 	}
 	fmt.Fprintln(os.Stderr)
 }
@@ -389,10 +397,10 @@ func cmdInteractive() {
 	}
 
 	printSessions(sessions)
-	fmt.Fprintf(os.Stderr, "  %sn)%s 新建会话\n", cyan, reset)
-	fmt.Fprintf(os.Stderr, "  %sq)%s 退出\n", cyan, reset)
+	fmt.Fprintf(os.Stderr, "  %s+)%s 新建会话\n", cBlue, reset)
+	fmt.Fprintf(os.Stderr, "  %sq)%s 退出\n", cGray, reset)
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintf(os.Stderr, "  选择 [1-%d/n/q]: ", len(sessions))
+	fmt.Fprintf(os.Stderr, "  %s❯%s ", cPurple, reset)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
@@ -403,7 +411,7 @@ func cmdInteractive() {
 	switch strings.ToLower(choice) {
 	case "q":
 		return
-	case "n":
+	case "n", "+":
 		cmdNew("")
 	default:
 		idx, err := strconv.Atoi(choice)
@@ -416,19 +424,24 @@ func cmdInteractive() {
 }
 
 func cmdHelp() {
-	fmt.Print(`spod - SuperPod 会话管理
-
-用法:
-  spod                连接会话（交互选择）
-  spod <name>         连接到指定会话（不存在则创建）
-  spod new [name]     创建新会话（自动编号）
-  spod ls             列出所有会话
-  spod kill <name>    关掉指定会话
-  spod killall        关掉所有会话
-  spod tunnel         启动/检查隧道
-  spod tunnel stop    关闭隧道
-  spod ssh            直接 SSH（不用 tmux）
-`)
+	fmt.Fprintf(os.Stderr, "\n  %s%sspod%s %s— SuperPod 会话管理%s\n\n", bold, cPurple, reset, cGray, reset)
+	fmt.Fprintf(os.Stderr, "  %s用法%s\n", bold, reset)
+	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
+	cmds := [][2]string{
+		{"spod", "交互选择 / 新建会话"},
+		{"spod <name>", "连接到指定会话（不存在则创建）"},
+		{"spod new [name]", "创建新会话（自动编号）"},
+		{"spod ls", "列出所有会话"},
+		{"spod kill <name>", "关掉指定会话"},
+		{"spod killall", "关掉所有会话"},
+		{"spod tunnel", "启动 / 检查隧道"},
+		{"spod tunnel stop", "关闭隧道"},
+		{"spod ssh", "直接 SSH（不用 tmux）"},
+	}
+	for _, c := range cmds {
+		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
+	}
+	fmt.Fprintln(os.Stderr)
 }
 
 func main() {
