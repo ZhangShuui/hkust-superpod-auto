@@ -15,12 +15,64 @@ import (
 	"time"
 )
 
-const (
-	host       = "superpod"
-	tunnelPort = "17897"
-	localPort  = "7897"
+var (
+	host       = envOr("SPOD_SSH_HOST", "superpod")
+	tunnelPort = envOr("TUNNEL_PORT", "17897")
+	localPort  = envOr("CLASH_PORT", "7897")
 	prefix     = "spod"
 )
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func init() {
+	// Load .env from project root (walk up from executable or cwd)
+	for _, base := range []string{os.Getenv("SPOD_ENV_FILE"), findDotenv()} {
+		if base == "" {
+			continue
+		}
+		data, err := os.ReadFile(base)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if k != "" && os.Getenv(k) == "" {
+				os.Setenv(k, v)
+			}
+		}
+		// Re-read vars after loading .env
+		host = envOr("SPOD_SSH_HOST", "superpod")
+		tunnelPort = envOr("TUNNEL_PORT", "17897")
+		localPort = envOr("CLASH_PORT", "7897")
+		break
+	}
+}
+
+func findDotenv() string {
+	// Try cwd, then walk up to find .env
+	dir, _ := os.Getwd()
+	for i := 0; i < 5 && dir != "/"; i++ {
+		p := filepath.Join(dir, ".env")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		dir = filepath.Dir(dir)
+	}
+	return ""
+}
 
 // ── Colors (256-color) ──
 

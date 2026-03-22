@@ -4,7 +4,13 @@
 
 set -e
 
-USER="${SUPERPOD_USER:?Set SUPERPOD_USER (e.g. export SUPERPOD_USER=youruser)}"
+# 加载 .env
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a; source "$SCRIPT_DIR/.env"; set +a
+fi
+
+USER="${SUPERPOD_USER:?Set SUPERPOD_USER in .env or environment}"
 SRC="$USER@superpod.ust.hk:/project/hdtaccuracy/trains"
 DST="/mnt/e/hdtaccuracy/trains/"
 

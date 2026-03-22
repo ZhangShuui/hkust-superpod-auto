@@ -22,10 +22,28 @@ import pyotp
 from playwright.sync_api import sync_playwright
 
 
+def _load_dotenv():
+    """Load .env file from project root if it exists."""
+    env_file = Path(__file__).resolve().parent / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and key not in os.environ:  # don't override existing env
+            os.environ[key] = value
+
+_load_dotenv()
+
 VPN_URL = "https://remote.ust.hk/mfa"
 DEFAULT_USER = os.environ.get("HKUST_USER", "")
-DEFAULT_PROXY = "http://127.0.0.1:7897"
-DEFAULT_HOSTS = ["superpod.ust.hk"]
+_clash_port = os.environ.get("CLASH_PORT", "7897")
+DEFAULT_PROXY = os.environ.get("VPN_PROXY", f"http://127.0.0.1:{_clash_port}")
+_vpn_hosts = os.environ.get("VPN_HOSTS", "")
+DEFAULT_HOSTS = _vpn_hosts.split() if _vpn_hosts else [os.environ.get("SUPERPOD_HOST", "superpod.ust.hk")]
 VPN_SLICE_PATH = os.environ.get(
     "VPN_SLICE_PATH",
     str(Path(__file__).resolve().parent / ".venv" / "bin" / "vpn-slice"),

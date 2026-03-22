@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .python-version
 uv.lock
+.env
 
 # Go build output
 cmd/spod/spod
