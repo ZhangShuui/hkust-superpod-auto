@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ var (
 	tunnelPort = envOr("TUNNEL_PORT", "17897")
 	localPort  = envOr("CLASH_PORT", "7897")
 	prefix     = "spod"
+	vpnScript  = "" // resolved in init()
 )
 
 func envOr(key, fallback string) string {
@@ -69,6 +71,22 @@ func init() {
 		tunnelPort = envOr("TUNNEL_PORT", "17897")
 		localPort = envOr("CLASH_PORT", "7897")
 		break
+	}
+
+	// Resolve VPN script path
+	vpnScript = envOr("VPN_SCRIPT", "")
+	if vpnScript == "" {
+		// Try to find hkust-vpn.py relative to .env or cwd
+		for _, dir := range []string{filepath.Dir(findDotenv()), "."} {
+			if dir == "" || dir == "." {
+				dir, _ = os.Getwd()
+			}
+			p := filepath.Join(dir, "hkust-vpn.py")
+			if _, err := os.Stat(p); err == nil {
+				vpnScript = p
+				break
+			}
+		}
 	}
 }
 
@@ -268,6 +286,142 @@ func stopTunnel() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	ok(fmt.Sprintf("隧道已关闭 (pid=%d)", pid))
+}
+
+// ── VPN ──
+
+var vpnPIDFile = filepath.Join(os.TempDir(), "spod-vpn.pid")
+
+func vpnPID() int {
+	data, err := os.ReadFile(vpnPIDFile)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	// Verify process is alive and is python
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		os.Remove(vpnPIDFile)
+		return 0
+	}
+	if !strings.Contains(string(cmdline), "hkust-vpn") {
+		os.Remove(vpnPIDFile)
+		return 0
+	}
+	return pid
+}
+
+func vpnIsUp() bool {
+	// Quick check: can we reach superpod.ust.hk on SSH port?
+	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func cmdVpnStart() {
+	if vpnScript == "" {
+		fail("找不到 hkust-vpn.py，设置 VPN_SCRIPT 环境变量或在项目目录运行")
+		os.Exit(1)
+	}
+
+	pid := vpnPID()
+	if pid > 0 {
+		ok(fmt.Sprintf("VPN 已在运行 (pid=%d)", pid))
+		return
+	}
+
+	info("启动 VPN (headless, auto-reconnect)...")
+
+	logPath := filepath.Join(filepath.Dir(vpnScript), "vpn.log")
+	cmd := exec.Command("python3", vpnScript, "--headless")
+	cmd.Dir = filepath.Dir(vpnScript)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // detach from terminal
+
+	// Redirect stdout/stderr to log (Python also logs to file, but capture startup errors)
+	logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if logFile != nil {
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+
+	if err := cmd.Start(); err != nil {
+		fail(fmt.Sprintf("VPN 启动失败: %v", err))
+		os.Exit(1)
+	}
+
+	// Save PID
+	os.WriteFile(vpnPIDFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0600)
+
+	// Don't wait for the process — it runs in background
+	go cmd.Wait()
+
+	// Wait for VPN to come up (check connectivity)
+	info("等待 VPN 连接建立...")
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		if vpnIsUp() {
+			ok(fmt.Sprintf("VPN 已连接 (pid=%d)", cmd.Process.Pid))
+			if logFile != nil {
+				logFile.Close()
+			}
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+	warn("VPN 进程已启动但连接尚未就绪，可能需要更多时间")
+	info(fmt.Sprintf("日志: %s", logPath))
+	if logFile != nil {
+		logFile.Close()
+	}
+}
+
+func cmdVpnStop() {
+	pid := vpnPID()
+	if pid == 0 {
+		warn("VPN 未运行")
+		return
+	}
+	// Kill the entire process group (openconnect runs as child)
+	syscall.Kill(-pid, syscall.SIGTERM)
+	syscall.Kill(pid, syscall.SIGTERM)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	os.Remove(vpnPIDFile)
+	ok(fmt.Sprintf("VPN 已停止 (pid=%d)", pid))
+}
+
+func cmdVpnStatus() {
+	pid := vpnPID()
+	if pid > 0 {
+		ok(fmt.Sprintf("VPN 进程运行中 (pid=%d)", pid))
+	} else {
+		warn("VPN 进程未运行")
+	}
+	if vpnIsUp() {
+		ok(fmt.Sprintf("SuperPod 可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
+	} else {
+		fail(fmt.Sprintf("SuperPod 不可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
+	}
+}
+
+func cmdVpnLog() {
+	logPath := filepath.Join(filepath.Dir(vpnScript), "vpn.log")
+	cmd := exec.Command("tail", "-f", "-n", "50", logPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run()
 }
 
 // ── Sessions ──
@@ -506,6 +660,10 @@ func cmdHelp() {
 		{"spod killall", "关掉所有会话"},
 		{"spod tunnel", "启动 / 检查隧道"},
 		{"spod tunnel stop", "关闭隧道"},
+		{"spod vpn", "启动 VPN（后台 headless）"},
+		{"spod vpn stop", "停止 VPN"},
+		{"spod vpn status", "查看 VPN 状态"},
+		{"spod vpn log", "实时查看 VPN 日志"},
 		{"spod ssh", "直接 SSH（不用 tmux）"},
 	}
 	for _, c := range cmds {
@@ -524,6 +682,21 @@ func main() {
 	switch cmd {
 	case "-h", "--help", "help":
 		cmdHelp()
+	case "vpn":
+		sub := ""
+		if len(args) > 1 {
+			sub = args[1]
+		}
+		switch sub {
+		case "stop":
+			cmdVpnStop()
+		case "status":
+			cmdVpnStatus()
+		case "log":
+			cmdVpnLog()
+		default:
+			cmdVpnStart()
+		}
 	case "tunnel":
 		if len(args) > 1 && args[1] == "stop" {
 			stopTunnel()
