@@ -22,7 +22,7 @@ spod kill <name>      # 关掉指定会话
 spod killall          # 关掉所有会话
 
 # ── 工具 ──
-spod sync             # 并行 rsync 拉取训练数据
+spod sync <r> <l>     # 从 SuperPod 并行 rsync 到本地
 spod sync stop        # 停止所有 rsync
 spod speed [秒]       # VPN 隧道测速（默认 60s）
 spod tunnel           # 启动 / 检查 SSH 反向隧道

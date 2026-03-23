@@ -442,57 +442,78 @@ func cmdVpnLog() {
 
 // ── Sync ──
 
-func cmdSync() {
+const spodSyncTag = "spod-sync" // marker for pkill
+
+func cmdSync(remotePath, localPath string) {
+	if remotePath == "" || localPath == "" {
+		fail("用法: spod sync <remote_path> <local_path>")
+		info("示例: spod sync /project/data/train ./data/")
+		info("示例: spod sync /home/user/results /mnt/e/results/")
+		os.Exit(1)
+	}
+
 	sshUser := envOr("SUPERPOD_USER", "")
 	if sshUser == "" {
 		fail("需要设置 SUPERPOD_USER（在 .env 或环境变量中）")
 		os.Exit(1)
 	}
 	superpodHost := envOr("SUPERPOD_HOST", "superpod.ust.hk")
-	src := sshUser + "@" + superpodHost + ":/project/hdtaccuracy/trains"
-	dst := "/mnt/e/hdtaccuracy/trains/"
+	src := sshUser + "@" + superpodHost + ":" + remotePath
+	dst := localPath
 
-	info("停止已有的 rsync...")
-	exec.Command("pkill", "-f", "rsync -rlP.*hdtaccuracy").Run()
-	time.Sleep(1 * time.Second)
-
-	os.MkdirAll(dst, 0755)
-
-	dirs := []string{
-		"converted_hf", "choice-sft-full", "gsspo", "gsspo_cot",
-		"llama-2-7b-tky", "nyc-llama2-7", "gspo_cot", "choice-sft",
-		"code-llama-tky", "code-llama-nyc", "ppo", "llama2-7", "sft",
-		"codeT5-tky", "codeT5-nyc", "grpo_cot", "grpo", "gspo",
+	// Ensure local dir exists
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		fail(fmt.Sprintf("创建目录失败: %v", err))
+		os.Exit(1)
 	}
 
-	info(fmt.Sprintf("启动 %d 路并行 rsync...", len(dirs)+1))
+	// List remote subdirectories for parallel sync
+	info(fmt.Sprintf("扫描远程目录 %s ...", remotePath))
+	dirList, err := ssh(fmt.Sprintf("ls -1d %s/*/ 2>/dev/null | xargs -n1 basename", remotePath))
 
-	rsyncArgs := []string{"-rlP", "--partial", "--inplace", "--no-times", "--no-perms"}
+	rsyncArgs := []string{
+		"-rlP", "--partial", "--inplace", "--no-times", "--no-perms",
+		fmt.Sprintf("--info=name0,progress2"), // compact progress
+	}
 
-	// trains 子目录并行
-	for _, dir := range dirs {
-		args := append(rsyncArgs, src+"/"+dir, dst)
+	if err != nil || dirList == "" {
+		// No subdirectories or ls failed — sync the whole path as one job
+		info("单路 rsync...")
+		args := append(rsyncArgs, src+"/", dst)
 		cmd := exec.Command("rsync", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), "SPOD_SYNC_TAG="+spodSyncTag)
+		if err := cmd.Run(); err != nil {
+			fail(fmt.Sprintf("rsync 失败: %v", err))
+			os.Exit(1)
+		}
+		ok("同步完成")
+		return
+	}
+
+	// Parallel sync each subdirectory
+	dirs := strings.Fields(dirList)
+	info(fmt.Sprintf("启动 %d 路并行 rsync...", len(dirs)))
+
+	for _, dir := range dirs {
+		args := append(append([]string{}, rsyncArgs...), src+"/"+dir, dst)
+		cmd := exec.Command("rsync", args...)
+		cmd.Env = append(os.Environ(), "SPOD_SYNC_TAG="+spodSyncTag)
 		cmd.Start()
 	}
 
-	// trains_big5
-	big5Args := append(rsyncArgs, sshUser+"@"+superpodHost+":/project/hdtaccuracy/trains_big5", "/mnt/e/hdtaccuracy/")
-	cmd := exec.Command("rsync", big5Args...)
-	cmd.Start()
-
 	time.Sleep(3 * time.Second)
 
-	// Count running rsync processes
-	out, _ := exec.Command("bash", "-c", "ps aux | grep 'rsync -rlP' | grep -v grep | wc -l").CombinedOutput()
+	out, _ := exec.Command("bash", "-c", "pgrep -fc 'rsync.*-rlP' || echo 0").CombinedOutput()
 	count := strings.TrimSpace(string(out))
-	ok(fmt.Sprintf("启动了 %s 路 rsync", count))
-	info("查看进度: du -sh /mnt/e/hdtaccuracy/trains/ /mnt/e/hdtaccuracy/trains_big5/")
+	ok(fmt.Sprintf("%s 路 rsync 运行中", count))
+	info(fmt.Sprintf("查看进度: du -sh %s", dst))
 	info("停止所有: spod sync stop")
 }
 
 func cmdSyncStop() {
-	exec.Command("pkill", "-f", "rsync -rlP.*hdtaccuracy").Run()
+	exec.Command("pkill", "-f", "rsync.*-rlP").Run()
 	ok("已停止所有 rsync")
 }
 
@@ -785,7 +806,7 @@ func cmdHelp() {
 		{"spod vpn log", "实时查看 VPN 日志"},
 		{"spod tunnel", "启动 / 检查 SSH 隧道"},
 		{"spod tunnel stop", "关闭隧道"},
-		{"spod sync", "并行 rsync 拉取训练数据"},
+		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
@@ -851,7 +872,14 @@ func main() {
 		if len(args) > 1 && args[1] == "stop" {
 			cmdSyncStop()
 		} else {
-			cmdSync()
+			remote, local := "", ""
+			if len(args) > 1 {
+				remote = args[1]
+			}
+			if len(args) > 2 {
+				local = args[2]
+			}
+			cmdSync(remote, local)
 		}
 	case "speed":
 		dur := ""
