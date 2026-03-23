@@ -6,6 +6,7 @@ __pycache__/
 .python-version
 uv.lock
 .env
+vpn.log*
 
 # Go build output
 cmd/spod/spod

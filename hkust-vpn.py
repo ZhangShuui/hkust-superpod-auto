@@ -12,6 +12,9 @@ import argparse
 import getpass
 import json
 import time
+import random
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import socket
@@ -57,6 +60,33 @@ VPN_SLICE_PATH = os.environ.get(
 )
 CRED_FILE = Path.home() / ".config" / "hkust-vpn" / "credentials.json"
 
+# ─── Retry / Timeout Constants ────────────────────────────────────────
+LOGIN_TIMEOUT = 180          # 3 min overall login timeout
+MAX_CONSECUTIVE_FAILURES = 5
+BACKOFF_BASE = 10            # seconds
+BACKOFF_CAP = 300            # 5 minutes
+HEALTH_CHECK_INTERVAL = 60   # seconds
+
+# ─── Logging ──────────────────────────────────────────────────────────
+
+LOG_FILE = Path(__file__).resolve().parent / "vpn.log"
+
+def _setup_logging():
+    """Dual logging: console + rotating file (5 MB, 3 backups)."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # File handler
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    root.addHandler(fh)
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(ch)
+
+_setup_logging()
+log = logging.getLogger("hkust-vpn")
+
 
 # ─── Credential Management ────────────────────────────────────────────
 
@@ -70,7 +100,7 @@ def save_credentials(user, password, totp_secret, sudo_password):
         "sudo_password": sudo_password,
     }))
     os.chmod(CRED_FILE, 0o600)
-    print(f"[+] Credentials saved to {CRED_FILE}")
+    log.info(f"[+] Credentials saved to {CRED_FILE}")
 
 
 def load_credentials():
@@ -91,9 +121,9 @@ def setup_credentials(user):
     try:
         totp = pyotp.TOTP(totp_secret)
         code = totp.now()
-        print(f"[+] TOTP test: current code = {code} (looks good)")
+        log.info(f"[+] TOTP test: current code = {code} (looks good)")
     except Exception as e:
-        print(f"[!] TOTP secret seems invalid: {e}")
+        log.error(f"[!] TOTP secret seems invalid: {e}")
         sys.exit(1)
 
     save_credentials(user, password, totp_secret, sudo_password)
@@ -103,10 +133,15 @@ def setup_credentials(user):
 # ─── Browser Login Automation ─────────────────────────────────────────
 
 def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
-    """Fully automated: open browser, login, MFA via TOTP, return DSID cookie."""
-    totp = pyotp.TOTP(totp_secret)
+    """Fully automated: open browser, login, MFA via TOTP, return DSID cookie.
 
-    print("[*] Starting automated VPN login...")
+    Returns the DSID cookie string on success, or None on failure.
+    Has an overall timeout of LOGIN_TIMEOUT seconds.
+    """
+    totp = pyotp.TOTP(totp_secret)
+    deadline = time.monotonic() + LOGIN_TIMEOUT
+
+    log.info("[*] Starting automated VPN login...")
 
     with sync_playwright() as p:
         launch_opts = {
@@ -142,26 +177,26 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             page.goto(VPN_URL, wait_until="domcontentloaded", timeout=60000)
 
             # ── Step 1: Enter email ──
-            print("[*] Step 1/5: Entering email...")
+            log.info("[*] Step 1/5: Entering email...")
             page.wait_for_selector('input[name="loginfmt"]', timeout=30000)
             page.fill('input[name="loginfmt"]', user)
             page.wait_for_timeout(300)
             page.click("#idSIButton9")
             page.wait_for_load_state("networkidle", timeout=15000)
-            print(f"[+] Email: {user}")
+            log.info(f"[+] Email: {user}")
 
             # ── Step 2: Enter password ──
-            print("[*] Step 2/5: Entering password...")
+            log.info("[*] Step 2/5: Entering password...")
             page.wait_for_selector('input[name="passwd"]', state="visible", timeout=15000)
             page.wait_for_timeout(500)
             page.fill('input[name="passwd"]', password)
             page.wait_for_timeout(300)
             page.click("#idSIButton9")
             page.wait_for_load_state("networkidle", timeout=15000)
-            print("[+] Password entered.")
+            log.info("[+] Password entered.")
 
             # ── Step 3: On "Verify your identity" → click "Use a verification code" ──
-            print("[*] Step 3/5: Switching to TOTP...")
+            log.info("[*] Step 3/5: Switching to TOTP...")
             page.wait_for_timeout(3000)
 
             # Try to find "Use a verification code" — with retries and Back fallback
@@ -191,7 +226,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                     }
                     return 'not_found';
                 }""")
-                print(f"[*]  -> Attempt {attempt+1}: click result = {found}")
+                log.info(f"[*]  -> Attempt {attempt+1}: click result = {found}")
                 if found != 'not_found':
                     break
 
@@ -209,7 +244,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                     return null;
                 }""")
                 if alt:
-                    print(f"[*]  -> Clicked alt link: '{alt}'")
+                    log.info(f"[*]  -> Clicked alt link: '{alt}'")
                     page.wait_for_timeout(3000)
                     continue
 
@@ -217,7 +252,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                 try:
                     back = page.locator("#idBtn_Back")
                     if back.is_visible(timeout=1000):
-                        print("[*]  -> Clicking 'Back' to exit FIDO2...")
+                        log.info("[*]  -> Clicking 'Back' to exit FIDO2...")
                         back.click()
                         page.wait_for_timeout(3000)
                 except Exception:
@@ -225,12 +260,12 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
             page.wait_for_timeout(3000)
             if found != 'not_found':
-                print("[+] Clicked 'Use a verification code'.")
+                log.info("[+] Clicked 'Use a verification code'.")
             else:
-                print("[!] Could not find 'Use a verification code', proceeding anyway...")
+                log.warning("[!] Could not find 'Use a verification code', proceeding anyway...")
 
             # ── Step 4: Enter TOTP code ──
-            print("[*] Step 4/5: Entering TOTP code...")
+            log.info("[*] Step 4/5: Entering TOTP code...")
             code = totp.now()
             otp_input = page.wait_for_selector(
                 "#idTxtBx_SAOTCC_OTC, input[name='otc'], input[type='tel'], input[type='number']",
@@ -240,23 +275,25 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             page.wait_for_timeout(300)
             page.click("#idSubmit_SAOTCC_Continue")
             page.wait_for_load_state("networkidle", timeout=15000)
-            print(f"[+] TOTP code: {code}")
+            log.info(f"[+] TOTP code: {code}")
 
             # ── Step 5: "Stay signed in?" → Yes ──
-            print("[*] Step 5/5: Stay signed in...")
+            log.info("[*] Step 5/5: Stay signed in...")
             try:
                 page.wait_for_selector("#idSIButton9", timeout=10000)
                 page.click("#idSIButton9")
-                print("[+] Clicked 'Yes'.")
+                log.info("[+] Clicked 'Yes'.")
             except Exception:
                 pass
 
-            # ── Wait for DSID cookie ──
-            print("[*] Waiting for VPN session cookie...")
+            # ── Wait for DSID cookie (deadline-aware) ──
+            log.info("[*] Waiting for VPN session cookie...")
             dsid = None
             session_confirmed = False
-            for i in range(120):
+            i = 0
+            while time.monotonic() < deadline:
                 page.wait_for_timeout(1000)
+                i += 1
 
                 # Handle "other user sessions in progress" confirmation page
                 if not session_confirmed and ("user-confirm" in page.url or "user%2Dconfirm" in page.url):
@@ -273,7 +310,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                             return null;
                         }""")
                         if clicked:
-                            print(f"[*] Existing session detected, clicked '{clicked}'")
+                            log.info(f"[*] Existing session detected, clicked '{clicked}'")
                             page.wait_for_timeout(3000)
                             session_confirmed = True
                     except Exception:
@@ -286,14 +323,15 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                         break
                 if dsid:
                     break
-                if i % 10 == 9:
-                    print(f"[*]  ... still waiting ({i+1}s)")
+                if i % 10 == 0:
+                    remaining = int(deadline - time.monotonic())
+                    log.info(f"[*]  ... still waiting ({i}s elapsed, {remaining}s left)")
 
         except Exception as e:
-            print(f"[!] Automated login error: {e}")
-            print("[*] Falling back to manual login. Complete in the browser.")
+            log.error(f"[!] Automated login error: {e}")
+            log.info("[*] Falling back to manual login. Complete in the browser.")
             dsid = None
-            for _ in range(300):
+            while time.monotonic() < deadline:
                 try:
                     page.wait_for_timeout(1000)
                     cookies = context.cookies("https://remote.ust.hk")
@@ -309,11 +347,11 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             browser.close()
 
     if dsid:
-        print(f"[+] Got DSID cookie: {dsid[:20]}...")
+        log.info(f"[+] Got DSID cookie: {dsid[:20]}...")
         return dsid
     else:
-        print("[-] Failed to get DSID cookie.")
-        sys.exit(1)
+        log.error("[-] Failed to get DSID cookie.")
+        return None
 
 
 # ─── VPN Connection ───────────────────────────────────────────────────
@@ -350,28 +388,51 @@ def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=10):
     vpn-slice can't resolve correctly when Clash intercepts DNS, so we
     do it manually after the tunnel is up.
     """
+    resolved = set()
     for attempt in range(retries):
         time.sleep(3)
         for host in hosts:
+            if host in resolved:
+                continue
             ip = dns_query_udp(host, vpn_dns)
             if ip:
                 marker = f"# hkust-vpn {host}"
-                # Add /etc/hosts entry
-                cmd_hosts = f"grep -q '{marker}' /etc/hosts || echo '{ip} {host}  {marker}' >> /etc/hosts"
-                # Update if IP changed
-                cmd_update = f"sed -i '/{marker}/c\\{ip} {host}  {marker}' /etc/hosts"
-                # Add route through tun0
-                cmd_route = f"ip route replace {ip}/32 dev tun0"
-                full_cmd = f"{cmd_hosts} && {cmd_update} && {cmd_route}"
-                proc = subprocess.run(
-                    ["sudo", "-S", "bash", "-c", full_cmd],
+                # Remove old entry, add fresh one, add route
+                cmd = (
+                    f"sed -i '/{marker}/d' /etc/hosts && "
+                    f"echo '{ip} {host}  {marker}' >> /etc/hosts && "
+                    f"ip route replace {ip}/32 dev tun0"
+                )
+                subprocess.run(
+                    ["sudo", "-S", "bash", "-c", cmd],
                     input=(sudo_password + "\n").encode(),
                     capture_output=True,
                 )
-                print(f"[+] DNS fix: {host} -> {ip} (route via tun0)")
-                return True
-    print("[!] DNS fix: could not resolve hosts via VPN DNS")
-    return False
+                log.info(f"[+] DNS fix: {host} -> {ip} (route via tun0)")
+                resolved.add(host)
+        if resolved == set(hosts):
+            return True
+    if not resolved:
+        log.warning("[!] DNS fix: could not resolve any hosts via VPN DNS")
+    return len(resolved) > 0
+
+
+def _health_check(hosts, interval=HEALTH_CHECK_INTERVAL):
+    """Periodically verify VPN tunnel passes traffic."""
+    time.sleep(30)  # give tunnel time to establish
+    while True:
+        reachable = False
+        for host in hosts:
+            try:
+                sock = socket.create_connection((host, 22), timeout=10)
+                sock.close()
+                reachable = True
+                break
+            except (socket.timeout, OSError):
+                continue
+        if not reachable:
+            log.warning(f"[!] Health check FAILED: none of {hosts} reachable on port 22")
+        time.sleep(interval)
 
 
 def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
@@ -391,13 +452,14 @@ def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
     if proxy:
         cmd.extend(["--proxy", proxy])
 
-    print(f"[*] Connecting VPN (split tunnel: {', '.join(hosts)})")
+    log.info(f"[*] Connecting VPN (split tunnel: {', '.join(hosts)})")
 
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge stderr into stdout
         )
         # Send sudo password
         if sudo_password:
@@ -412,53 +474,99 @@ def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
         )
         dns_thread.start()
 
-        proc.wait()
+        # Health check in background
+        health_thread = threading.Thread(
+            target=_health_check,
+            args=(hosts,),
+            daemon=True,
+        )
+        health_thread.start()
+
+        # Read and log openconnect output
+        for line in proc.stdout:
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                log.info(f"[openconnect] {text}")
+
+        rc = proc.wait()
+        log.info(f"[*] openconnect exited with code {rc}")
+
     except KeyboardInterrupt:
-        print("\n[*] VPN disconnected.")
+        log.info("\n[*] VPN disconnected.")
         raise  # re-raise so auto_reconnect knows it was user-initiated
 
 
 def auto_reconnect(user, password, totp_secret, sudo_password,
                    proxy=None, hosts=None, headless=False):
-    """Auto-reconnect loop: re-login and reconnect when session expires.
+    """Auto-reconnect loop with exponential backoff on login failures.
 
     HKUST VPN limits:
       - Inactivity timeout: 30 min
       - Max session length: 240 min (4 hours)
     """
     attempt = 0
+    consecutive_login_failures = 0
+
     while True:
         attempt += 1
         start = time.time()
-        print(f"\n{'='*50}")
-        print(f"[*] VPN session #{attempt} starting at {time.strftime('%H:%M:%S')}")
-        print(f"[*] Session will expire in ~4 hours (240 min)")
-        print(f"{'='*50}\n")
+        log.info(f"\n{'='*50}")
+        log.info(f"[*] VPN session #{attempt} starting at {time.strftime('%H:%M:%S')}")
+        log.info(f"[*] Session will expire in ~4 hours (240 min)")
+        log.info(f"{'='*50}\n")
 
         try:
             dsid = get_dsid_cookie(user, password, totp_secret,
                                    proxy=proxy, headless=headless)
+        except KeyboardInterrupt:
+            log.info("\n[*] User interrupted. Exiting.")
+            break
+
+        if dsid is None:
+            consecutive_login_failures += 1
+            log.warning(f"[!] Login failed ({consecutive_login_failures}/{MAX_CONSECUTIVE_FAILURES})")
+
+            if consecutive_login_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.error(f"[-] {MAX_CONSECUTIVE_FAILURES} consecutive login failures. Giving up.")
+                sys.exit(1)
+
+            # Exponential backoff with jitter
+            delay = min(BACKOFF_BASE * (2 ** (consecutive_login_failures - 1)), BACKOFF_CAP)
+            jitter = random.uniform(0, delay * 0.3)
+            wait = delay + jitter
+            log.info(f"[*] Retrying in {wait:.0f}s (backoff)...")
+
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                log.info("\n[*] User interrupted. Exiting.")
+                break
+            continue
+
+        # Login succeeded — reset failure counter
+        consecutive_login_failures = 0
+
+        try:
             connect_vpn(dsid, proxy=proxy, hosts=hosts,
                         sudo_password=sudo_password)
         except KeyboardInterrupt:
-            print("\n[*] User interrupted. Exiting.")
+            log.info("\n[*] User interrupted. Exiting.")
             break
 
         elapsed = time.time() - start
-        print(f"\n[!] VPN disconnected after {elapsed/60:.1f} minutes.")
+        log.info(f"\n[!] VPN disconnected after {elapsed/60:.1f} minutes.")
 
         if elapsed < 30:
-            # If it disconnected very quickly, something is wrong
             wait = 10
-            print(f"[!] Session too short. Waiting {wait}s before retry...")
+            log.warning(f"[!] Session too short. Waiting {wait}s before retry...")
         else:
             wait = 5
-            print(f"[*] Reconnecting in {wait}s... (Ctrl+C to stop)")
+            log.info(f"[*] Reconnecting in {wait}s... (Ctrl+C to stop)")
 
         try:
             time.sleep(wait)
         except KeyboardInterrupt:
-            print("\n[*] User interrupted. Exiting.")
+            log.info("\n[*] User interrupted. Exiting.")
             break
 
 
@@ -506,6 +614,8 @@ def main():
         if not sudo_password:
             sudo_password = getpass.getpass("[?] sudo password: ")
 
+    log.info(f"[*] Log file: {LOG_FILE}")
+
     if args.cookie:
         dsid = args.cookie
         connect_vpn(dsid, proxy=proxy, hosts=args.hosts, sudo_password=sudo_password)
@@ -514,6 +624,9 @@ def main():
             args.user, password, totp_secret,
             proxy=proxy, headless=args.headless,
         )
+        if dsid is None:
+            log.error("[-] Login failed. Exiting.")
+            sys.exit(1)
         connect_vpn(dsid, proxy=proxy, hosts=args.hosts, sudo_password=sudo_password)
     else:
         auto_reconnect(
