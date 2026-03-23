@@ -1,7 +1,7 @@
 [project]
 name = "hkust-superpod-auto"
 version = "0.1.0"
-description = "Add your description here"
+description = "One-command toolkit for HKUST SuperPod: VPN, SSH tunnel, tmux sessions, Claude Code"
 requires-python = ">=3.13"
 dependencies = [
     "playwright>=1.58.0",

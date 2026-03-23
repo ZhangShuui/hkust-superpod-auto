@@ -151,20 +151,22 @@ EOF
 ## 项目结构
 
 ```
-├── cmd/spod/               # spod CLI (Go)
-│   ├── main.go             #   VPN / 隧道 / 会话管理
+├── cmd/spod/           # spod CLI (Go)
+│   ├── main.go
 │   └── go.mod
-├── hkust-vpn.py            # VPN 自动连接（Playwright + openconnect）
-├── .env.example            # 配置模板
-├── sync.sh                 # SuperPod 文件同步（rsync 并行+断点续传）
-├── speedtest.sh            # VPN 测速
-├── HKUST-VPN-README.md     # VPN 详细文档
-├── SUPERPOD-SESSION-README.md  # SLURM 会话管理指南
-└── SYNC-README.md          # 文件同步文档
+├── hkust-vpn.py        # VPN 自动连接（Playwright + openconnect）
+├── .env.example        # 配置模板
+├── pyproject.toml      # Python 依赖声明
+├── sync.sh             # SuperPod 文件同步
+├── speedtest.sh        # VPN 测速
+└── docs/
+    ├── vpn.md          # VPN 详细文档
+    ├── slurm.md        # SLURM 会话管理指南
+    └── sync.md         # 文件同步文档
 ```
 
 ## 其他文档
 
-- [VPN 详细文档](./HKUST-VPN-README.md) — 登录流程、参数、故障排查
-- [SuperPod 会话管理](./SUPERPOD-SESSION-README.md) — SLURM 容器化 GPU 会话
-- [文件同步](./SYNC-README.md) — rsync 并行下载训练数据
+- [VPN 详细文档](./docs/vpn.md) — 登录流程、参数、故障排查
+- [SuperPod 会话管理](./docs/slurm.md) — SLURM 容器化 GPU 会话
+- [文件同步](./docs/sync.md) — rsync 并行下载训练数据
