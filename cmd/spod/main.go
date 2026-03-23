@@ -440,6 +440,111 @@ func cmdVpnLog() {
 	cmd.Run()
 }
 
+// ── Sync ──
+
+func cmdSync() {
+	sshUser := envOr("SUPERPOD_USER", "")
+	if sshUser == "" {
+		fail("需要设置 SUPERPOD_USER（在 .env 或环境变量中）")
+		os.Exit(1)
+	}
+	superpodHost := envOr("SUPERPOD_HOST", "superpod.ust.hk")
+	src := sshUser + "@" + superpodHost + ":/project/hdtaccuracy/trains"
+	dst := "/mnt/e/hdtaccuracy/trains/"
+
+	info("停止已有的 rsync...")
+	exec.Command("pkill", "-f", "rsync -rlP.*hdtaccuracy").Run()
+	time.Sleep(1 * time.Second)
+
+	os.MkdirAll(dst, 0755)
+
+	dirs := []string{
+		"converted_hf", "choice-sft-full", "gsspo", "gsspo_cot",
+		"llama-2-7b-tky", "nyc-llama2-7", "gspo_cot", "choice-sft",
+		"code-llama-tky", "code-llama-nyc", "ppo", "llama2-7", "sft",
+		"codeT5-tky", "codeT5-nyc", "grpo_cot", "grpo", "gspo",
+	}
+
+	info(fmt.Sprintf("启动 %d 路并行 rsync...", len(dirs)+1))
+
+	rsyncArgs := []string{"-rlP", "--partial", "--inplace", "--no-times", "--no-perms"}
+
+	// trains 子目录并行
+	for _, dir := range dirs {
+		args := append(rsyncArgs, src+"/"+dir, dst)
+		cmd := exec.Command("rsync", args...)
+		cmd.Start()
+	}
+
+	// trains_big5
+	big5Args := append(rsyncArgs, sshUser+"@"+superpodHost+":/project/hdtaccuracy/trains_big5", "/mnt/e/hdtaccuracy/")
+	cmd := exec.Command("rsync", big5Args...)
+	cmd.Start()
+
+	time.Sleep(3 * time.Second)
+
+	// Count running rsync processes
+	out, _ := exec.Command("bash", "-c", "ps aux | grep 'rsync -rlP' | grep -v grep | wc -l").CombinedOutput()
+	count := strings.TrimSpace(string(out))
+	ok(fmt.Sprintf("启动了 %s 路 rsync", count))
+	info("查看进度: du -sh /mnt/e/hdtaccuracy/trains/ /mnt/e/hdtaccuracy/trains_big5/")
+	info("停止所有: spod sync stop")
+}
+
+func cmdSyncStop() {
+	exec.Command("pkill", "-f", "rsync -rlP.*hdtaccuracy").Run()
+	ok("已停止所有 rsync")
+}
+
+// ── Speedtest ──
+
+func cmdSpeedtest(durationStr string) {
+	duration := 60
+	if durationStr != "" {
+		if d, err := strconv.Atoi(durationStr); err == nil && d > 0 {
+			duration = d
+		}
+	}
+
+	// Read initial tun0 RX bytes
+	readRX := func() int64 {
+		data, err := os.ReadFile("/proc/net/dev")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, "tun0") {
+				fields := strings.Fields(strings.TrimSpace(line))
+				if len(fields) >= 2 {
+					// fields[0] is "tun0:", fields[1] is RX bytes
+					val := strings.TrimSuffix(fields[0], ":")
+					_ = val
+					rx, _ := strconv.ParseInt(fields[1], 10, 64)
+					return rx
+				}
+			}
+		}
+		return 0
+	}
+
+	rx1 := readRX()
+	if rx1 == 0 {
+		fail("tun0 接口不存在，VPN 未连接？")
+		os.Exit(1)
+	}
+
+	info(fmt.Sprintf("测速中... (%ds)", duration))
+	time.Sleep(time.Duration(duration) * time.Second)
+
+	rx2 := readRX()
+	bytes := rx2 - rx1
+	mb := float64(bytes) / 1024 / 1024
+	speed := mb / float64(duration)
+
+	ok(fmt.Sprintf("%ds 接收: %.1f MB", duration, mb))
+	ok(fmt.Sprintf("平均速度: %.2f MB/s", speed))
+}
+
 // ── Sessions ──
 
 type session struct {
@@ -674,13 +779,16 @@ func cmdHelp() {
 		{"spod ls", "列出所有会话"},
 		{"spod kill <name>", "关掉指定会话"},
 		{"spod killall", "关掉所有会话"},
-		{"spod tunnel", "启动 / 检查隧道"},
-		{"spod tunnel stop", "关闭隧道"},
 		{"spod vpn", "启动 VPN（后台 headless）"},
 		{"spod vpn stop", "停止 VPN"},
-		{"spod vpn status", "查看 VPN 状态"},
+		{"spod vpn status", "查看 VPN + SuperPod 状态"},
 		{"spod vpn log", "实时查看 VPN 日志"},
-		{"spod ssh", "直接 SSH（不用 tmux）"},
+		{"spod tunnel", "启动 / 检查 SSH 隧道"},
+		{"spod tunnel stop", "关闭隧道"},
+		{"spod sync", "并行 rsync 拉取训练数据"},
+		{"spod sync stop", "停止所有 rsync"},
+		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
+		{"spod ssh", "裸 SSH（不用 tmux）"},
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
@@ -739,6 +847,18 @@ func main() {
 	case "killall":
 		ensureTunnel()
 		cmdKillAll()
+	case "sync":
+		if len(args) > 1 && args[1] == "stop" {
+			cmdSyncStop()
+		} else {
+			cmdSync()
+		}
+	case "speed":
+		dur := ""
+		if len(args) > 1 {
+			dur = args[1]
+		}
+		cmdSpeedtest(dur)
 	case "ssh":
 		ensureTunnel()
 		if err := sshInteractive(); err != nil {

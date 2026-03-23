@@ -21,7 +21,10 @@ spod ls               # 列出所有会话
 spod kill <name>      # 关掉指定会话
 spod killall          # 关掉所有会话
 
-# ── 底层 ──
+# ── 工具 ──
+spod sync             # 并行 rsync 拉取训练数据
+spod sync stop        # 停止所有 rsync
+spod speed [秒]       # VPN 隧道测速（默认 60s）
 spod tunnel           # 启动 / 检查 SSH 反向隧道
 spod tunnel stop      # 关闭隧道
 spod ssh              # 裸 SSH（不进 tmux）
@@ -151,14 +154,12 @@ EOF
 ## 项目结构
 
 ```
-├── cmd/spod/           # spod CLI (Go)
-│   ├── main.go
+├── cmd/spod/           # spod CLI (Go) — 统一入口
+│   ├── main.go         #   VPN / 隧道 / 会话 / sync / speedtest
 │   └── go.mod
 ├── hkust-vpn.py        # VPN 自动连接（Playwright + openconnect）
 ├── .env.example        # 配置模板
 ├── pyproject.toml      # Python 依赖声明
-├── sync.sh             # SuperPod 文件同步
-├── speedtest.sh        # VPN 测速
 └── docs/
     ├── vpn.md          # VPN 详细文档
     ├── slurm.md        # SLURM 会话管理指南

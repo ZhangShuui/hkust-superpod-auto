@@ -10,3 +10,5 @@ vpn.log*
 
 # Go build output
 cmd/spod/spod
+sync.sh
+speedtest.sh
