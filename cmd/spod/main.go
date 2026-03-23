@@ -76,11 +76,18 @@ func init() {
 	// Resolve VPN script path
 	vpnScript = envOr("VPN_SCRIPT", "")
 	if vpnScript == "" {
-		// Try to find hkust-vpn.py relative to .env or cwd
-		for _, dir := range []string{filepath.Dir(findDotenv()), "."} {
-			if dir == "" || dir == "." {
-				dir, _ = os.Getwd()
+		// Try to find hkust-vpn.py relative to .env (resolve symlinks) or cwd
+		candidates := []string{}
+		if dotenv := findDotenv(); dotenv != "" {
+			// Resolve symlinks to find the real project directory
+			if real, err := filepath.EvalSymlinks(dotenv); err == nil {
+				candidates = append(candidates, filepath.Dir(real))
 			}
+			candidates = append(candidates, filepath.Dir(dotenv))
+		}
+		cwd, _ := os.Getwd()
+		candidates = append(candidates, cwd)
+		for _, dir := range candidates {
 			p := filepath.Join(dir, "hkust-vpn.py")
 			if _, err := os.Stat(p); err == nil {
 				vpnScript = p
@@ -339,8 +346,17 @@ func cmdVpnStart() {
 	info("启动 VPN (headless, auto-reconnect)...")
 
 	logPath := filepath.Join(filepath.Dir(vpnScript), "vpn.log")
-	cmd := exec.Command("python3", vpnScript, "--headless")
-	cmd.Dir = filepath.Dir(vpnScript)
+
+	// Use venv python if available, otherwise system python3
+	scriptDir := filepath.Dir(vpnScript)
+	pythonBin := "python3"
+	venvPython := filepath.Join(scriptDir, ".venv", "bin", "python3")
+	if _, err := os.Stat(venvPython); err == nil {
+		pythonBin = venvPython
+	}
+
+	cmd := exec.Command(pythonBin, vpnScript, "--headless")
+	cmd.Dir = scriptDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // detach from terminal
 
 	// Redirect stdout/stderr to log (Python also logs to file, but capture startup errors)

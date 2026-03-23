@@ -72,17 +72,18 @@ HEALTH_CHECK_INTERVAL = 60   # seconds
 LOG_FILE = Path(__file__).resolve().parent / "vpn.log"
 
 def _setup_logging():
-    """Dual logging: console + rotating file (5 MB, 3 backups)."""
+    """Dual logging: console (if tty) + rotating file (5 MB, 3 backups)."""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     # File handler
     fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     root.addHandler(fh)
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(message)s"))
-    root.addHandler(ch)
+    # Console handler — only when stdout is a terminal (avoids double-logging in background)
+    if sys.stdout.isatty():
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(ch)
 
 _setup_logging()
 log = logging.getLogger("hkust-vpn")
@@ -329,20 +330,23 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
         except Exception as e:
             log.error(f"[!] Automated login error: {e}")
-            log.info("[*] Falling back to manual login. Complete in the browser.")
             dsid = None
-            while time.monotonic() < deadline:
-                try:
-                    page.wait_for_timeout(1000)
-                    cookies = context.cookies("https://remote.ust.hk")
-                    for cookie in cookies:
-                        if cookie["name"] == "DSID":
-                            dsid = cookie["value"]
+            if headless:
+                log.warning("[!] Headless 模式，跳过手动登录 fallback")
+            else:
+                log.info("[*] Falling back to manual login. Complete in the browser.")
+                while time.monotonic() < deadline:
+                    try:
+                        page.wait_for_timeout(1000)
+                        cookies = context.cookies("https://remote.ust.hk")
+                        for cookie in cookies:
+                            if cookie["name"] == "DSID":
+                                dsid = cookie["value"]
+                                break
+                        if dsid:
                             break
-                    if dsid:
+                    except Exception:
                         break
-                except Exception:
-                    break
         finally:
             browser.close()
 
