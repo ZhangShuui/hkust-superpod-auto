@@ -105,10 +105,22 @@ def save_credentials(user, password, totp_secret, sudo_password):
 
 
 def load_credentials():
-    """Load saved credentials."""
+    """Load credentials from env vars first, then fall back to credentials file."""
+    creds = {}
     if CRED_FILE.exists():
-        return json.loads(CRED_FILE.read_text())
-    return {}
+        creds = json.loads(CRED_FILE.read_text())
+    # Env vars take priority
+    env_map = {
+        "user": "HKUST_USER",
+        "password": "HKUST_PASSWORD",
+        "totp_secret": "HKUST_TOTP_SECRET",
+        "sudo_password": "SUDO_PASSWORD",
+    }
+    for key, env_var in env_map.items():
+        val = os.environ.get(env_var, "")
+        if val:
+            creds[key] = val
+    return creds
 
 
 def setup_credentials(user):
@@ -198,7 +210,17 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
             # ── Step 3: On "Verify your identity" → click "Use a verification code" ──
             log.info("[*] Step 3/5: Switching to TOTP...")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
+
+            # Debug: screenshot + dump visible text for MFA page analysis
+            debug_dir = Path(__file__).resolve().parent
+            try:
+                page.screenshot(path=str(debug_dir / "mfa-debug.png"))
+                page_text = page.evaluate("() => document.body.innerText")
+                (debug_dir / "mfa-debug.txt").write_text(page_text)
+                log.info(f"[*] MFA page debug saved to mfa-debug.png/txt")
+            except Exception as e:
+                log.warning(f"[!] Debug screenshot failed: {e}")
 
             # Try to find "Use a verification code" — with retries and Back fallback
             found = 'not_found'
@@ -233,11 +255,14 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
                 # Not found — try clicking "I can't use my Microsoft Authenticator app right now"
                 alt = page.evaluate("""() => {
-                    const els = document.querySelectorAll('a, div, span, p, button');
+                    const els = document.querySelectorAll('a[id], a[href], button, div[role=button]');
                     for (const el of els) {
                         const t = (el.textContent || '').trim();
+                        if (t.length > 100) continue;  // skip large containers
+                        if (t.includes('@')) continue;  // skip email-like text
                         if (t.includes("can't use") || t.includes('other way') ||
-                            t.includes('Sign in another way') || t.includes('different method')) {
+                            t.includes('Sign in another way') || t.includes('different method') ||
+                            t.includes('I want to use a different') || t.includes('Use a different')) {
                             el.click();
                             return t.substring(0, 60);
                         }
@@ -267,13 +292,27 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
             # ── Step 4: Enter TOTP code ──
             log.info("[*] Step 4/5: Entering TOTP code...")
+            page.wait_for_timeout(5000)  # extra wait for OTP input to render
+
+            otp_input = None
+            for otp_attempt in range(3):
+                try:
+                    otp_input = page.wait_for_selector(
+                        "#idTxtBx_SAOTCC_OTC, input[name='otc'], input[type='tel'], input[type='number']",
+                        timeout=10000,
+                    )
+                    if otp_input and otp_input.is_visible():
+                        break
+                except Exception:
+                    log.info(f"[*] OTP input not ready, retry {otp_attempt+1}/3...")
+                    page.wait_for_timeout(3000)
+
+            if not otp_input:
+                raise Exception("OTP input field not found after retries")
+
             code = totp.now()
-            otp_input = page.wait_for_selector(
-                "#idTxtBx_SAOTCC_OTC, input[name='otc'], input[type='tel'], input[type='number']",
-                timeout=10000,
-            )
             otp_input.fill(code)
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(500)
             page.click("#idSubmit_SAOTCC_Continue")
             page.wait_for_load_state("networkidle", timeout=15000)
             log.info(f"[+] TOTP code: {code}")

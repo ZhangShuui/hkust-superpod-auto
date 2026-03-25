@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -377,20 +378,49 @@ func cmdVpnStart() {
 	// Don't wait for the process — it runs in background
 	go cmd.Wait()
 
-	// Wait for VPN to come up (check connectivity)
-	info("等待 VPN 连接建立...")
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		if vpnIsUp() {
-			ok(fmt.Sprintf("VPN 已连接 (pid=%d)", cmd.Process.Pid))
+	// Open a persistent status pane via Windows Terminal split
+	spodBin, _ := os.Executable()
+	if spodBin == "" {
+		spodBin = "/home/shurui/.local/bin/spod"
+	}
+
+	// Try opening a separate small Windows Terminal window (WSL2)
+	if wtBin, err := exec.LookPath("wt.exe"); err == nil {
+		wtCmd := exec.Command(wtBin, "-w", "_",
+			"--size", "30,8",
+			"--pos", "9999,9999",
+			"--title", "VPN Status",
+			"wsl.exe", "--", "bash", "-lc", spodBin+" vpn watch")
+		if err := wtCmd.Start(); err == nil {
+			go wtCmd.Wait()
+			info(fmt.Sprintf("VPN 启动中 (pid=%d)，状态窗口已打开", cmd.Process.Pid))
 			if logFile != nil {
 				logFile.Close()
 			}
 			return
 		}
-		time.Sleep(3 * time.Second)
 	}
-	warn("VPN 进程已启动但连接尚未就绪，可能需要更多时间")
+
+	// Fallback: inline spinner
+	info("等待 VPN 连接建立...")
+	deadline := time.Now().Add(90 * time.Second)
+	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	i := 0
+	for time.Now().Before(deadline) {
+		if vpnIsUp() {
+			fmt.Printf("\r\033[2K")
+			ok("\\(ᵔᵕᵔ)/  VPN 已连接！")
+			if logFile != nil {
+				logFile.Close()
+			}
+			return
+		}
+		fmt.Printf("\r  %s ( •_•) 连接中...", spin[i%len(spin)])
+		i++
+		time.Sleep(300 * time.Millisecond)
+	}
+	fmt.Printf("\r\033[2K")
+	warn("( ×_×)  VPN 进程已启动但连接尚未就绪")
 	info(fmt.Sprintf("日志: %s", logPath))
 	if logFile != nil {
 		logFile.Close()
@@ -429,6 +459,165 @@ func cmdVpnStatus() {
 		ok(fmt.Sprintf("SuperPod 可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
 	} else {
 		fail(fmt.Sprintf("SuperPod 不可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
+	}
+}
+
+func cmdVpnWidget() {
+	// Compact one-line status for shell prompt / tmux
+	// --color flag enables ANSI colors
+	color := len(os.Args) > 3 && os.Args[3] == "--color"
+	pid := vpnPID()
+	if pid > 0 && vpnIsUp() {
+		if color {
+			fmt.Print("\033[32mᕕ(ᐛ)ᕗ ✔\033[0m")
+		} else {
+			fmt.Print("ᕕ(ᐛ)ᕗ ✔")
+		}
+	} else if pid > 0 {
+		if color {
+			fmt.Print("\033[33m(•_•) …\033[0m")
+		} else {
+			fmt.Print("(•_•) …")
+		}
+	} else {
+		if color {
+			fmt.Print("\033[31m(×_×) ✘\033[0m")
+		} else {
+			fmt.Print("(×_×) ✘")
+		}
+	}
+}
+
+func cmdVpnWatch() {
+	// Persistent animated VPN status panel (runs in a split pane)
+	type frame struct {
+		art   string
+		label string
+	}
+	connecting := []frame{
+		{"    ( •_•)     ", "准备连接"},
+		{"    ( •_•)>    ", "输入邮箱"},
+		{"    (⌐■_■)    ", "输入密码"},
+		{"   ( ˘▽˘)っ♨  ", "TOTP 验证"},
+		{"   ᕕ( ᐛ )ᕗ   ", "建立隧道"},
+		{"   ᕕ( ᐛ )ᕗ   ", "DNS 修复"},
+	}
+	celebrateFrame := frame{"   \\(ᵔᵕᵔ)/   ", "VPN 已连接"}
+	idleFrames := []frame{
+		{"    (￣▽￣)    ", "VPN 在线~"},
+		{"    (・ω・)    ", "VPN 在线~"},
+		{"    (ᵕ‿ᵕ)     ", "VPN 在线~"},
+		{"    (◕‿◕)     ", "VPN 在线~"},
+	}
+	disconnectedFrame := frame{"    ( ×_×)    ", " VPN 未连接"}
+
+	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	bars := []string{"○ ○ ○ ○ ○", "● ○ ○ ○ ○", "● ● ○ ○ ○", "● ● ● ○ ○", "● ● ● ● ○", "● ● ● ● ◐"}
+
+	// Parse VPN log to detect current step
+	logPath := ""
+	if vpnScript != "" {
+		logPath = filepath.Join(filepath.Dir(vpnScript), "vpn.log")
+	}
+
+	currentStep := 0
+	var mu sync.Mutex
+
+	if logPath != "" {
+		tailCmd := exec.Command("tail", "-n", "0", "-f", logPath)
+		tailOut, _ := tailCmd.StdoutPipe()
+		tailCmd.Start()
+		defer tailCmd.Process.Kill()
+		go func() {
+			scanner := bufio.NewScanner(tailOut)
+			for scanner.Scan() {
+				line := scanner.Text()
+				mu.Lock()
+				switch {
+				case strings.Contains(line, "Step 1/5"):
+					currentStep = 1
+				case strings.Contains(line, "Step 2/5"):
+					currentStep = 2
+				case strings.Contains(line, "Step 3/5"), strings.Contains(line, "Step 4/5"):
+					currentStep = 3
+				case strings.Contains(line, "Step 5/5"), strings.Contains(line, "Connecting VPN"):
+					currentStep = 4
+				case strings.Contains(line, "DNS fix"):
+					currentStep = 5
+				case strings.Contains(line, "session #"):
+					currentStep = 0 // reset on reconnect
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Background connectivity probe (vpnIsUp has 3s timeout, can't call in render loop)
+	var isUp bool
+	go func() {
+		for {
+			up := vpnIsUp()
+			mu.Lock()
+			isUp = up
+			mu.Unlock()
+			if up {
+				time.Sleep(5 * time.Second)
+			} else {
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}()
+
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h")
+
+	spinIdx := 0
+	var connectedSince time.Time
+	wasUp := false
+	for {
+		pid := vpnPID()
+		mu.Lock()
+		up := isUp
+		s := currentStep
+		mu.Unlock()
+
+		// Track when connection was established
+		if up && !wasUp {
+			connectedSince = time.Now()
+		}
+		wasUp = up
+
+		// Draw — cursor home + clear
+		fmt.Print("\033[H\033[2J")
+
+		if pid > 0 && up {
+			var f frame
+			if time.Since(connectedSince) < 15*time.Second {
+				f = celebrateFrame
+			} else {
+				f = idleFrames[(spinIdx/15)%len(idleFrames)]
+			}
+			fmt.Printf("\n  \033[32m%s\033[0m\n", f.art)
+			fmt.Printf("  \033[32m  ● ● ● ● ●  \033[0m\n\n")
+			fmt.Printf("  \033[32m  %s\033[0m\n", f.label)
+		} else if pid > 0 {
+			if s >= len(connecting) {
+				s = len(connecting) - 1
+			}
+			f := connecting[s]
+			fmt.Printf("\n  \033[33m%s\033[0m\n", f.art)
+			fmt.Printf("  \033[33m  %s %s  \033[0m\n\n", spin[spinIdx%len(spin)], bars[s])
+			fmt.Printf("  \033[33m  %s\033[0m\n", f.label)
+		} else {
+			f := disconnectedFrame
+			fmt.Printf("\n  \033[31m%s\033[0m\n", f.art)
+			fmt.Printf("  \033[31m  ○ ○ ○ ○ ○  \033[0m\n\n")
+			fmt.Printf("  \033[31m  %s\033[0m\n", f.label)
+		}
+
+		spinIdx++
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -839,6 +1028,10 @@ func main() {
 			cmdVpnStatus()
 		case "log":
 			cmdVpnLog()
+		case "widget":
+			cmdVpnWidget()
+		case "watch":
+			cmdVpnWatch()
 		default:
 			cmdVpnStart()
 		}
