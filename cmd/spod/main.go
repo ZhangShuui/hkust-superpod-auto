@@ -96,6 +96,90 @@ func init() {
 			}
 		}
 	}
+
+	// Auto-generate/sync ~/.ssh/config for superpod from .env
+	ensureSSHConfig()
+}
+
+func ensureSSHConfig() {
+	sshUser := envOr("SUPERPOD_USER", "")
+	sshHost := envOr("SUPERPOD_HOST", "superpod.ust.hk")
+	if sshUser == "" {
+		return
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	configPath := filepath.Join(sshDir, "config")
+
+	// Desired config block
+	desired := fmt.Sprintf(`Host superpod
+    HostName %s
+    User %s
+
+    # 心跳：每 15s 发一次，连续 4 次无响应才断（容忍 60s 网络抖动）
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+    TCPKeepAlive yes`, sshHost, sshUser)
+
+	// Read existing config
+	existing, _ := os.ReadFile(configPath)
+	content := string(existing)
+
+	// Check if superpod block exists
+	if strings.Contains(content, "Host superpod") {
+		// Extract current User from existing block
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "User ") {
+				currentUser := strings.TrimPrefix(line, "User ")
+				if currentUser == sshUser {
+					return // already correct
+				}
+				break
+			}
+		}
+		// User mismatch — replace the whole superpod block
+		// Find block boundaries (from "Host superpod" to next "Host " or EOF)
+		lines := strings.Split(content, "\n")
+		var result []string
+		inBlock := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "Host superpod" {
+				inBlock = true
+				continue
+			}
+			if inBlock && strings.HasPrefix(trimmed, "Host ") {
+				inBlock = false
+			}
+			if inBlock {
+				continue
+			}
+			result = append(result, line)
+		}
+		// Remove leading/trailing blank lines and append new block
+		cleaned := strings.TrimSpace(strings.Join(result, "\n"))
+		if cleaned != "" {
+			cleaned += "\n\n"
+		}
+		content = cleaned + desired + "\n"
+	} else {
+		// No superpod block — append
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if content != "" {
+			content += "\n"
+		}
+		content += desired + "\n"
+	}
+
+	os.MkdirAll(sshDir, 0700)
+	os.WriteFile(configPath, []byte(content), 0600)
 }
 
 func findDotenv() string {
