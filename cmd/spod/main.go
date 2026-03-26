@@ -944,8 +944,28 @@ func ensureTmuxConf() {
 	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
 }
 
+func ensureRemoteProxy() {
+	// Ensure proxy env vars in remote ~/.bashrc so both Claude Code and Codex
+	// can reach their APIs through the reverse tunnel → local Clash proxy.
+	marker := "# spod-proxy"
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", tunnelPort)
+	script := fmt.Sprintf(
+		`grep -q '%s' ~/.bashrc 2>/dev/null || cat >> ~/.bashrc << 'SPOD_EOF'
+
+%s
+export http_proxy=%s
+export https_proxy=%s
+export HTTP_PROXY=%s
+export HTTPS_PROXY=%s
+SPOD_EOF`,
+		marker, marker, proxyURL, proxyURL, proxyURL, proxyURL,
+	)
+	ssh(script)
+}
+
 func attachOrCreate(name string) {
 	ensureTmuxConf()
+	ensureRemoteProxy()
 	info(fmt.Sprintf("连接到 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
 		var exitErr *exec.ExitError
@@ -978,6 +998,7 @@ func cmdNew(name string) {
 		name = fullName(name)
 	}
 	ensureTmuxConf()
+	ensureRemoteProxy()
 	info(fmt.Sprintf("创建会话 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
 		var exitErr *exec.ExitError

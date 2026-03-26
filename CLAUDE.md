@@ -51,7 +51,8 @@ One-command toolkit for connecting to HKUST SuperPod HPC from WSL2 and running C
 Local WSL2
   ├─ spod vpn → hkust-vpn.py → openconnect + vpn-slice → HKUST network
   ├─ Clash (:7890) ◄── autossh reverse tunnel ◄── SuperPod (:17897)
-  └─ spod → SSH + tmux → SuperPod → Claude Code (API via tunnel → Clash → Anthropic)
+  └─ spod → SSH + tmux → SuperPod → Claude Code (→ :17897 → Clash → Anthropic API)
+                                    → Codex     (→ :17897 → Clash → OpenAI API)
 ```
 
 ## Common Workflows
@@ -63,6 +64,21 @@ spod                # Connect to SuperPod tmux session
 spod ssh            # Raw SSH without tmux
 spod tunnel         # Start/check reverse tunnel for Claude Code API proxy
 ```
+
+## SuperPod Remote Setup
+
+After VPN + SSH are working, sync local credentials to SuperPod so Claude Code and Codex can call their APIs:
+
+```bash
+# Codex credentials (ChatGPT auth, stored in ~/.codex/)
+ssh superpod 'mkdir -p ~/.codex'
+scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
+
+# Proxy env vars are auto-configured by spod (ensureRemoteProxy writes to remote ~/.bashrc)
+# Both Claude Code and Codex use: http://127.0.0.1:17897 → local Clash → internet
+```
+
+Codex is installed globally in the `claude` conda env on SuperPod (`npm install -g @openai/codex`).
 
 ## Critical Gotchas
 

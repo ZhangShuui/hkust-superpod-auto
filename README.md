@@ -1,6 +1,6 @@
 # HKUST SuperPod Auto
 
-一站式工具链，从本地 WSL2 连接 HKUST SuperPod HPC 集群并在上面使用 Claude Code。
+一站式工具链，从本地 WSL2 连接 HKUST SuperPod HPC 集群并在上面使用 Claude Code / Codex。
 
 ## `spod` CLI
 
@@ -73,9 +73,10 @@ python3 hkust-vpn.py --setup
 spod vpn              # 启动 VPN（后台，自动重连）
 spod                  # 连接 SuperPod → tmux 会话
 claude                # 在 SuperPod 上使用 Claude Code
+codex                 # 在 SuperPod 上使用 Codex
 
 # 断线了？
-spod                  # 重连，tmux 保住了 Claude Code 进程
+spod                  # 重连，tmux 保住了进程
 ```
 
 ## 架构
@@ -85,12 +86,12 @@ spod                  # 重连，tmux 保住了 Claude Code 进程
     │
     ├─ spod vpn ─── hkust-vpn.py ─── openconnect + vpn-slice ─── HKUST 内网
     │                                                                  │
-    ├─ Clash (:7897) ◄──── autossh 反向隧道 ◄──────────── SuperPod (:17897)
+    ├─ Clash (:7890) ◄──── autossh 反向隧道 ◄──────────── SuperPod (:17897)
     │                                                          │
     └─ spod ─── SSH + tmux ──────────────────────────── SuperPod
                                                                │
-                                                         Claude Code
-                                                    (API → :17897 → 隧道 → Clash → Anthropic)
+                                                         Claude Code / Codex
+                                                    (API → :17897 → 隧道 → Clash → Anthropic / OpenAI)
 ```
 
 ## 核心能力
@@ -108,7 +109,7 @@ spod                  # 重连，tmux 保住了 Claude Code 进程
 
 ## SuperPod 环境配置
 
-首次使用前需在 SuperPod 上配置 Claude Code：
+首次使用前需在 SuperPod 上配置 Claude Code 和 Codex：
 
 ```bash
 ssh superpod
@@ -118,6 +119,7 @@ module load Anaconda3/2023.09-0
 conda create -n claude nodejs=20 -y
 conda activate claude
 npm install -g @anthropic-ai/claude-code
+npm install -g @openai/codex
 
 # 写入 .bashrc
 echo 'conda activate claude' >> ~/.bashrc
@@ -128,6 +130,23 @@ export HTTP_PROXY=http://127.0.0.1:17897
 export HTTPS_PROXY=http://127.0.0.1:17897
 EOF
 ```
+
+> **注意**：proxy 环境变量由 `spod` 自动写入远程 `~/.bashrc`（`ensureRemoteProxy`），无需手动配置。
+
+### 同步本地凭证到 SuperPod
+
+Codex 使用 ChatGPT 账号认证（非 API key），需要把本地登录凭证传到 SuperPod：
+
+```bash
+# 本地先登录 Codex（如果还没登录过）
+codex login
+
+# 同步凭证到 SuperPod
+ssh superpod 'mkdir -p ~/.codex'
+scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
+```
+
+凭证有过期时间，如果 SuperPod 上 Codex 报认证错误，重新在本地 `codex login` 后再 scp 一次。
 
 ## 前置条件
 
