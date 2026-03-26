@@ -939,7 +939,13 @@ func printSessions(sessions []session) {
 	fmt.Fprintln(os.Stderr)
 }
 
+func ensureTmuxConf() {
+	// Ensure mouse mode is enabled in remote ~/.tmux.conf
+	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
+}
+
 func attachOrCreate(name string) {
+	ensureTmuxConf()
 	info(fmt.Sprintf("连接到 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
 		var exitErr *exec.ExitError
@@ -971,6 +977,7 @@ func cmdNew(name string) {
 	} else {
 		name = fullName(name)
 	}
+	ensureTmuxConf()
 	info(fmt.Sprintf("创建会话 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
 		var exitErr *exec.ExitError
