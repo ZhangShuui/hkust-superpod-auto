@@ -292,7 +292,17 @@ func tunnelPID() int {
 	return 0
 }
 
+func ensureVPN() {
+	if vpnIsUp() {
+		return
+	}
+	fail("VPN 未连接 — SuperPod 不可达 (:22)")
+	info("运行 `spod vpn` 启动 VPN")
+	os.Exit(1)
+}
+
 func ensureTunnel() {
+	ensureVPN()
 	// Lockfile to prevent concurrent tunnel starts
 	lockPath := filepath.Join(os.TempDir(), "spod-tunnel.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
