@@ -51,8 +51,14 @@ One-command toolkit for connecting to HKUST SuperPod HPC from WSL2 and running C
 Local WSL2
   ├─ spod vpn → hkust-vpn.py → openconnect + vpn-slice → HKUST network
   ├─ Clash (:7890) ◄── autossh reverse tunnel ◄── SuperPod (:17897)
+  ├─ spod socks → autossh -D 0.0.0.0:1080 → SOCKS5 代理 → Windows 可用
   └─ spod → SSH + tmux → SuperPod → Claude Code (→ :17897 → Clash → Anthropic API)
                                     → Codex     (→ :17897 → Clash → OpenAI API)
+
+Windows ──► SOCKS5 (127.0.0.1:1080) ──► WSL VPN ──► SuperPod 内网
+  ├─ SSH (connect.exe -S)
+  ├─ VS Code Remote-SSH
+  └─ 浏览器 (Jupyter/Grafana)
 ```
 
 ## Common Workflows
@@ -63,6 +69,9 @@ spod vpn status     # Check VPN + SuperPod reachability
 spod                # Connect to SuperPod tmux session
 spod ssh            # Raw SSH without tmux
 spod tunnel         # Start/check reverse tunnel for Claude Code API proxy
+spod socks          # Start SOCKS5 proxy for Windows access
+spod socks status   # Check SOCKS5 proxy status
+spod socks stop     # Stop SOCKS5 proxy
 ```
 
 ## SuperPod Remote Setup
@@ -88,6 +97,8 @@ Codex is installed globally in the `claude` conda env on SuperPod (`npm install 
 - `.env` has real passwords and TOTP secret — never commit, never log.
 - SSH config entry `Host superpod` is auto-synced by `spod` on every run (via `ensureSSHConfig()`).
 - SuperPod login nodes: NO computation. Always use `srun` for GPU work.
+- **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP (143.89.x.x) which SuperPod can't reach from inside. Windows SSH config must use internal IP (`10.22.4.12`) as HostName, not the public hostname.
+- **Windows SSH needs its own key** — WSL and Windows have different SSH keys. Windows public key must be in SuperPod's `~/.ssh/authorized_keys`.
 
 ## Build
 

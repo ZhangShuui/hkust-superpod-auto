@@ -21,6 +21,7 @@ var (
 	host       = envOr("SPOD_SSH_HOST", "superpod")
 	tunnelPort = envOr("TUNNEL_PORT", "17897")
 	localPort  = envOr("CLASH_PORT", "7897")
+	socksPort  = envOr("SOCKS_PORT", "1080")
 	prefix     = "spod"
 	vpnScript  = "" // resolved in init()
 )
@@ -71,6 +72,7 @@ func init() {
 		host = envOr("SPOD_SSH_HOST", "superpod")
 		tunnelPort = envOr("TUNNEL_PORT", "17897")
 		localPort = envOr("CLASH_PORT", "7897")
+		socksPort = envOr("SOCKS_PORT", "1080")
 		break
 	}
 
@@ -388,6 +390,140 @@ func stopTunnel() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	ok(fmt.Sprintf("隧道已关闭 (pid=%d)", pid))
+}
+
+// ── SOCKS proxy ──
+
+// socksPID finds the autossh process managing our SOCKS proxy.
+func socksPID() int {
+	cmd := exec.Command("pgrep", "-f", "autossh.*-D 0.0.0.0:"+socksPort)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return 0
+	}
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		return 0
+	}
+	for _, line := range strings.Split(out, "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cmdline), "autossh") {
+			return pid
+		}
+	}
+	return 0
+}
+
+func ensureSocks() {
+	ensureVPN()
+	lockPath := filepath.Join(os.TempDir(), "spod-socks.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+	if err == nil {
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+			warn(fmt.Sprintf("无法获取锁: %v", err))
+		}
+		defer func() {
+			syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			lockFile.Close()
+		}()
+	}
+
+	pid := socksPID()
+	if pid > 0 {
+		ok(fmt.Sprintf("SOCKS5 代理运行中 (pid=%d, 0.0.0.0:%s)", pid, socksPort))
+		return
+	}
+
+	info(fmt.Sprintf("启动 SOCKS5 代理 (0.0.0.0:%s → SuperPod)...", socksPort))
+
+	logPath := filepath.Join(os.TempDir(), "spod-socks.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		warn(fmt.Sprintf("无法打开日志文件: %v", err))
+	}
+
+	cmd2 := exec.Command("autossh", "-M", "0", "-f", "-N",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "TCPKeepAlive=yes",
+		"-D", fmt.Sprintf("0.0.0.0:%s", socksPort),
+		host,
+	)
+	if logFile != nil {
+		cmd2.Stdout = logFile
+		cmd2.Stderr = logFile
+	}
+	if err := cmd2.Run(); err != nil {
+		fail(fmt.Sprintf("SOCKS5 代理启动失败: %v", err))
+		fail("检查 VPN 是否在运行")
+		if logFile != nil {
+			fail(fmt.Sprintf("日志: %s", logPath))
+			logFile.Close()
+		}
+		os.Exit(1)
+	}
+	if logFile != nil {
+		logFile.Close()
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if socksPID() > 0 {
+			ok(fmt.Sprintf("SOCKS5 代理已建立 (0.0.0.0:%s)", socksPort))
+			info("Windows 侧设置 SOCKS5 代理: 127.0.0.1:" + socksPort)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fail("SOCKS5 代理启动超时")
+	fail(fmt.Sprintf("日志: %s", logPath))
+	os.Exit(1)
+}
+
+func stopSocks() {
+	pid := socksPID()
+	if pid == 0 {
+		warn("SOCKS5 代理未运行")
+		return
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		warn(fmt.Sprintf("进程 %d 已不存在", pid))
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	ok(fmt.Sprintf("SOCKS5 代理已关闭 (pid=%d)", pid))
+}
+
+func socksStatus() {
+	pid := socksPID()
+	if pid > 0 {
+		ok(fmt.Sprintf("SOCKS5 代理运行中 (pid=%d, 0.0.0.0:%s)", pid, socksPort))
+		// Check if port is actually listening
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+socksPort, 2*time.Second)
+		if err != nil {
+			warn("端口未监听 — 进程可能卡住，尝试 `spod socks stop` 后重启")
+		} else {
+			conn.Close()
+			ok("端口监听正常")
+		}
+	} else {
+		warn("SOCKS5 代理未运行")
+	}
 }
 
 // ── VPN ──
@@ -1117,6 +1253,9 @@ func cmdHelp() {
 		{"spod vpn log", "实时查看 VPN 日志"},
 		{"spod tunnel", "启动 / 检查 SSH 隧道"},
 		{"spod tunnel stop", "关闭隧道"},
+		{"spod socks", "启动 SOCKS5 代理（Windows 可用）"},
+		{"spod socks stop", "关闭 SOCKS5 代理"},
+		{"spod socks status", "查看 SOCKS5 代理状态"},
 		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
@@ -1162,6 +1301,19 @@ func main() {
 			stopTunnel()
 		} else {
 			ensureTunnel()
+		}
+	case "socks":
+		sub := ""
+		if len(args) > 1 {
+			sub = args[1]
+		}
+		switch sub {
+		case "stop":
+			stopSocks()
+		case "status":
+			socksStatus()
+		default:
+			ensureSocks()
 		}
 	case "ls":
 		ensureTunnel()

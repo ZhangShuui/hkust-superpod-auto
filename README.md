@@ -28,6 +28,11 @@ spod speed [秒]       # VPN 隧道测速（默认 60s）
 spod tunnel           # 启动 / 检查 SSH 反向隧道
 spod tunnel stop      # 关闭隧道
 spod ssh              # 裸 SSH（不进 tmux）
+
+# ── Windows 接入 ──
+spod socks            # 启动 SOCKS5 代理（Windows 可通过 127.0.0.1:1080 接入）
+spod socks status     # 查看 SOCKS5 代理状态
+spod socks stop       # 关闭 SOCKS5 代理
 ```
 
 ## Quick Start
@@ -88,6 +93,11 @@ spod                  # 重连，tmux 保住了进程
     │                                                                  │
     ├─ Clash (:7890) ◄──── autossh 反向隧道 ◄──────────── SuperPod (:17897)
     │                                                          │
+    ├─ spod socks ─── autossh -D 0.0.0.0:1080 ─── SOCKS5 代理
+    │                       ▲                           │
+    │                       │                     Windows 可用
+    │                  Windows SSH / 浏览器 / VS Code
+    │
     └─ spod ─── SSH + tmux ──────────────────────────── SuperPod
                                                                │
                                                          Claude Code / Codex
@@ -106,6 +116,45 @@ spod                  # 重连，tmux 保住了进程
 | 防 Broken pipe | 15s 心跳探测，60s 容忍网络抖动 |
 | VPN 健康检查 | 后台每 60s TCP 探测 SuperPod:22 |
 | 日志持久化 | vpn.log 轮转（5MB × 3 份） |
+| Windows 接入 | SOCKS5 代理让 Windows SSH/浏览器/VS Code 共享 WSL VPN 隧道 |
+
+## Windows 接入 SuperPod
+
+WSL 建立 VPN 后，Windows 可通过 SOCKS5 代理访问 SuperPod 内网：
+
+```bash
+# WSL 中启动 SOCKS5 代理
+spod socks
+```
+
+### Windows SSH 配置
+
+在 `C:\Users\<你的用户名>\.ssh\config` 中加入：
+
+```
+Host superpod.ust.hk superpod
+    HostName 10.22.4.12
+    User <your-itsc-id>
+    ProxyCommand "C:\Program Files\Git\mingw64\bin\connect.exe" -S 127.0.0.1:1080 %h %p
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+```
+
+> **注意**：HostName 必须用内网 IP（`10.22.4.12`），不能用 `superpod.ust.hk`（公网 IP 有 hairpin NAT 限制）。
+>
+> Windows 和 WSL 的 SSH 密钥不同，首次使用需把 Windows 公钥加到 SuperPod：
+> ```bash
+> # 在 WSL 中执行
+> cat /mnt/c/Users/<你的用户名>/.ssh/id_ed25519.pub | ssh superpod 'cat >> ~/.ssh/authorized_keys'
+> ```
+
+### 浏览器访问内网
+
+启动 SOCKS 代理后，浏览器设置 SOCKS5 代理 `127.0.0.1:1080` 即可访问 SuperPod 内网 Web 服务（Jupyter、Grafana 等）。推荐使用 SwitchyOmega 等浏览器扩展按域名切换代理。
+
+### VS Code Remote-SSH
+
+配好上面的 SSH config 后，VS Code Remote-SSH 扩展直接选 `superpod` 即可连接。
 
 ## SuperPod 环境配置
 
@@ -167,6 +216,7 @@ scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
 | `SUPERPOD_HOST` | 主机名 | VPN 脚本 |
 | `CLASH_PORT` | 本地 Clash 端口 | spod + VPN |
 | `TUNNEL_PORT` | 反向隧道端口 | spod |
+| `SOCKS_PORT` | SOCKS5 代理端口（默认 1080） | spod socks |
 | `SPOD_SSH_HOST` | SSH Host 别名 | spod |
 | `VPN_SCRIPT` | VPN 脚本路径 | spod |
 
