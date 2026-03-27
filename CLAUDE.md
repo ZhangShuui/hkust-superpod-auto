@@ -97,7 +97,7 @@ Codex is installed globally in the `claude` conda env on SuperPod (`npm install 
 - `.env` has real passwords and TOTP secret — never commit, never log.
 - SSH config entry `Host superpod` is auto-synced by `spod` on every run (via `ensureSSHConfig()`).
 - SuperPod login nodes: NO computation. Always use `srun` for GPU work.
-- **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP (143.89.x.x) which SuperPod can't reach from inside. Windows SSH config must use internal IP (`10.22.4.12`) as HostName, not the public hostname.
+- **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP which SuperPod can't reach from inside. Windows SSH config must use internal IP as HostName (query via `ssh superpod "hostname -I" | awk '{print $1}'`).
 - **Windows SSH needs its own key** — WSL and Windows have different SSH keys. Windows public key must be in SuperPod's `~/.ssh/authorized_keys`.
 
 ## Build

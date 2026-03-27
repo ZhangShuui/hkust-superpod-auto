@@ -23,7 +23,7 @@ Before proceeding, verify:
    - Current problem nodes → `--exclude` list
    - Available partitions and limits
    - Container image paths
-3. **No duplicate jobs**: `ssh superpod 'module load slurm 2>/dev/null; squeue -u szhangfa -o "%j %T" --noheader'` — warn if a job with the same name is already running.
+3. **No duplicate jobs**: `ssh superpod 'module load slurm 2>/dev/null; squeue -u $USER -o "%j %T" --noheader'` — warn if a job with the same name is already running.
 
 ## Step 1: Determine Job Parameters
 

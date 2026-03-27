@@ -34,7 +34,7 @@ Options:
 ### 1a. Check running/pending jobs
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && squeue -u szhangfa -o "%i %j %P %T %M %l %D %C %b %N" --noheader'
+ssh superpod 'module load slurm 2>/dev/null && squeue -u $USER -o "%i %j %P %T %M %l %D %C %b %N" --noheader'
 ```
 
 If jobs found, display as a formatted table:
@@ -45,7 +45,7 @@ If jobs found, display as a formatted table:
 ### 1b. Check recently completed jobs (last 24h)
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && sacct -u szhangfa --starttime now-1day --format=JobID%10,JobName%20,Partition%10,State%12,ExitCode%8,Elapsed%12,NNodes%6,NCPUS%6,TRESUsageInTot%40 --noheader | head -20'
+ssh superpod 'module load slurm 2>/dev/null && sacct -u $USER --starttime now-1day --format=JobID%10,JobName%20,Partition%10,State%12,ExitCode%8,Elapsed%12,NNodes%6,NCPUS%6,TRESUsageInTot%40 --noheader | head -20'
 ```
 
 Display completed jobs, highlighting:
@@ -81,12 +81,12 @@ Extract and display:
 Search for log files matching this job:
 
 ```bash
-ssh superpod "find /home/szhangfa -maxdepth 3 -name '*<JOBID>*' -newer /home/szhangfa -mtime -7 2>/dev/null | head -10"
+ssh superpod "find /home/$USER -maxdepth 3 -name '*<JOBID>*' -newer /home/$USER -mtime -7 2>/dev/null | head -10"
 ```
 
 Also check standard locations:
 ```bash
-ssh superpod "ls -la /home/szhangfa/*/logs/*<JOBID>* 2>/dev/null; ls -la /home/szhangfa/logs/*<JOBID>* 2>/dev/null"
+ssh superpod "ls -la /home/$USER/*/logs/*<JOBID>* 2>/dev/null; ls -la /home/$USER/logs/*<JOBID>* 2>/dev/null"
 ```
 
 For each log file found (`.out` and `.err`):

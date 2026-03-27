@@ -10,7 +10,7 @@ Collect SuperPod cluster specs via SSH and save a structured reference document.
 ## Connection
 
 - SSH target: `superpod` (alias from ~/.ssh/config, auto-synced by `spod`)
-- User: `szhangfa`
+- User: read from `$SUPERPOD_USER` in `.env`
 - Prerequisite: VPN must be running (`spod vpn status` to check)
 
 ## Steps

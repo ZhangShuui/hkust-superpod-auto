@@ -133,14 +133,16 @@ spod socks
 
 ```
 Host superpod.ust.hk superpod
-    HostName 10.22.4.12
+    HostName <superpod-internal-ip>
     User <your-itsc-id>
     ProxyCommand "C:\Program Files\Git\mingw64\bin\connect.exe" -S 127.0.0.1:1080 %h %p
     ServerAliveInterval 15
     ServerAliveCountMax 4
 ```
 
-> **注意**：HostName 必须用内网 IP（`10.22.4.12`），不能用 `superpod.ust.hk`（公网 IP 有 hairpin NAT 限制）。
+> **注意**：HostName 必须用 SuperPod 的**内网 IP**，不能用 `superpod.ust.hk`（公网 IP 有 hairpin NAT 限制，SOCKS 代理从 SuperPod 内部无法回连公网 IP）。
+>
+> 查询内网 IP：`ssh superpod "hostname -I" | awk '{print $1}'`
 >
 > Windows 和 WSL 的 SSH 密钥不同，首次使用需把 Windows 公钥加到 SuperPod：
 > ```bash
