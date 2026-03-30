@@ -30,6 +30,7 @@ spod tunnel stop      # 关闭隧道
 spod ssh              # 裸 SSH（不进 tmux）
 
 # ── Windows 接入 ──
+spod vscode           # 一键配置 Windows VS Code Remote-SSH
 spod socks            # 启动 SOCKS5 代理（Windows 可通过 127.0.0.1:1080 接入）
 spod socks status     # 查看 SOCKS5 代理状态
 spod socks stop       # 关闭 SOCKS5 代理
@@ -117,46 +118,39 @@ spod                  # 重连，tmux 保住了进程
 | VPN 健康检查 | 后台每 60s TCP 探测 SuperPod:22 |
 | 日志持久化 | vpn.log 轮转（5MB × 3 份） |
 | Windows 接入 | SOCKS5 代理让 Windows SSH/浏览器/VS Code 共享 WSL VPN 隧道 |
+| VS Code 一键配置 | `spod vscode` 自动配 SSH config、公钥、SOCKS 代理 |
+| SSH 自动重试 | 网络抖动时自动重试 3 次（2s→4s→8s 退避） |
+| 精准代理 | 只有 claude/codex 走隧道代理，git/pip 等直连 |
 
 ## Windows 接入 SuperPod
 
-WSL 建立 VPN 后，Windows 可通过 SOCKS5 代理访问 SuperPod 内网：
+WSL 建立 VPN 后，Windows 可通过 SOCKS5 代理访问 SuperPod 内网。
+
+### VS Code Remote-SSH（推荐）
+
+一条命令自动完成所有配置：
 
 ```bash
-# WSL 中启动 SOCKS5 代理
-spod socks
+spod vscode
 ```
 
-### Windows SSH 配置
+自动完成：
+- 启动 SOCKS5 代理
+- 查询 SuperPod 内网 IP（绕过 hairpin NAT）
+- 检测并添加 Windows SSH 公钥到 SuperPod
+- 写入 Windows SSH 配置（`C:\Users\<你>\.ssh\config`）
 
-在 `C:\Users\<你的用户名>\.ssh\config` 中加入：
+之后在 VS Code 中：**Ctrl+Shift+P → Remote-SSH: Connect to Host → superpod**
 
-```
-Host superpod.ust.hk superpod
-    HostName <superpod-internal-ip>
-    User <your-itsc-id>
-    ProxyCommand "C:\Program Files\Git\mingw64\bin\connect.exe" -S 127.0.0.1:1080 %h %p
-    ServerAliveInterval 15
-    ServerAliveCountMax 4
-```
-
-> **注意**：HostName 必须用 SuperPod 的**内网 IP**，不能用 `superpod.ust.hk`（公网 IP 有 hairpin NAT 限制，SOCKS 代理从 SuperPod 内部无法回连公网 IP）。
->
-> 查询内网 IP：`ssh superpod "hostname -I" | awk '{print $1}'`
->
-> Windows 和 WSL 的 SSH 密钥不同，首次使用需把 Windows 公钥加到 SuperPod：
-> ```bash
-> # 在 WSL 中执行
-> cat /mnt/c/Users/<你的用户名>/.ssh/id_ed25519.pub | ssh superpod 'cat >> ~/.ssh/authorized_keys'
-> ```
+> 前置条件：[Git for Windows](https://git-scm.com/download/win)（提供 `connect.exe`）、VS Code [Remote-SSH 扩展](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
 
 ### 浏览器访问内网
 
-启动 SOCKS 代理后，浏览器设置 SOCKS5 代理 `127.0.0.1:1080` 即可访问 SuperPod 内网 Web 服务（Jupyter、Grafana 等）。推荐使用 SwitchyOmega 等浏览器扩展按域名切换代理。
+```bash
+spod socks   # 启动 SOCKS5 代理（如果 spod vscode 已启动则无需重复）
+```
 
-### VS Code Remote-SSH
-
-配好上面的 SSH config 后，VS Code Remote-SSH 扩展直接选 `superpod` 即可连接。
+浏览器设置 SOCKS5 代理 `127.0.0.1:1080` 即可访问 SuperPod 内网 Web 服务（Jupyter、Grafana 等）。推荐使用 SwitchyOmega 等浏览器扩展按域名切换代理。
 
 ## SuperPod 环境配置
 
@@ -174,15 +168,9 @@ npm install -g @openai/codex
 
 # 写入 .bashrc
 echo 'conda activate claude' >> ~/.bashrc
-cat >> ~/.bashrc << 'EOF'
-export http_proxy=http://127.0.0.1:17897
-export https_proxy=http://127.0.0.1:17897
-export HTTP_PROXY=http://127.0.0.1:17897
-export HTTPS_PROXY=http://127.0.0.1:17897
-EOF
 ```
 
-> **注意**：proxy 环境变量由 `spod` 自动写入远程 `~/.bashrc`（`ensureRemoteProxy`），无需手动配置。
+> **注意**：代理配置由 `spod` 自动管理 — 只有 `claude` 和 `codex` 命令会走反向隧道代理，其他命令（git、pip、npm 等）直连网络，无需手动配置。
 
 ### 同步本地凭证到 SuperPod
 

@@ -69,6 +69,7 @@ spod vpn status     # Check VPN + SuperPod reachability
 spod                # Connect to SuperPod tmux session
 spod ssh            # Raw SSH without tmux
 spod tunnel         # Start/check reverse tunnel for Claude Code API proxy
+spod vscode         # One-command setup for Windows VS Code Remote-SSH
 spod socks          # Start SOCKS5 proxy for Windows access
 spod socks status   # Check SOCKS5 proxy status
 spod socks stop     # Stop SOCKS5 proxy
@@ -83,8 +84,8 @@ After VPN + SSH are working, sync local credentials to SuperPod so Claude Code a
 ssh superpod 'mkdir -p ~/.codex'
 scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
 
-# Proxy env vars are auto-configured by spod (ensureRemoteProxy writes to remote ~/.bashrc)
-# Both Claude Code and Codex use: http://127.0.0.1:17897 → local Clash → internet
+# Proxy is auto-configured by spod — only claude/codex commands get proxy env vars
+# (via shell wrapper functions in remote ~/.bashrc), git/pip/npm etc. go direct
 ```
 
 Codex is installed globally in the `claude` conda env on SuperPod (`npm install -g @openai/codex`).
@@ -97,8 +98,8 @@ Codex is installed globally in the `claude` conda env on SuperPod (`npm install 
 - `.env` has real passwords and TOTP secret — never commit, never log.
 - SSH config entry `Host superpod` is auto-synced by `spod` on every run (via `ensureSSHConfig()`).
 - SuperPod login nodes: NO computation. Always use `srun` for GPU work.
-- **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP which SuperPod can't reach from inside. Windows SSH config must use internal IP as HostName (query via `ssh superpod "hostname -I" | awk '{print $1}'`).
-- **Windows SSH needs its own key** — WSL and Windows have different SSH keys. Windows public key must be in SuperPod's `~/.ssh/authorized_keys`.
+- **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP which SuperPod can't reach from inside. `spod vscode` handles this automatically by using internal IP.
+- **Windows SSH needs its own key** — WSL and Windows have different SSH keys. `spod vscode` auto-adds Windows public key to SuperPod's `~/.ssh/authorized_keys`.
 
 ## Build
 

@@ -551,6 +551,160 @@ func socksStatus() {
 	}
 }
 
+// ── VS Code (Windows Remote-SSH) ──
+
+// findWindowsUser returns the Windows username by looking at /mnt/c/Users/.
+func findWindowsUser() string {
+	entries, err := os.ReadDir("/mnt/c/Users")
+	if err != nil {
+		return ""
+	}
+	skip := map[string]bool{"Public": true, "Default": true, "Default User": true, "All Users": true}
+	for _, e := range entries {
+		if !e.IsDir() || skip[e.Name()] || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		// Check if it has a real profile (has Desktop folder)
+		if _, err := os.Stat(filepath.Join("/mnt/c/Users", e.Name(), "Desktop")); err == nil {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
+// findConnectExe searches common locations for connect.exe (Git for Windows).
+func findConnectExe() string {
+	candidates := []string{
+		`C:\Program Files\Git\mingw64\bin\connect.exe`,
+		`C:\Program Files (x86)\Git\mingw64\bin\connect.exe`,
+	}
+	for _, c := range candidates {
+		wslPath := "/mnt/c/" + strings.ReplaceAll(strings.TrimPrefix(c, `C:\`), `\`, "/")
+		if _, err := os.Stat(wslPath); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+func cmdVscode() {
+	// 1. Ensure SOCKS proxy is running
+	ensureSocks()
+
+	// 2. Find Windows user
+	winUser := findWindowsUser()
+	if winUser == "" {
+		fail("无法检测 Windows 用户名（/mnt/c/Users/ 下找不到用户目录）")
+		os.Exit(1)
+	}
+	winSSHDir := filepath.Join("/mnt/c/Users", winUser, ".ssh")
+	winConfigPath := filepath.Join(winSSHDir, "config")
+
+	// 3. Get SuperPod internal IP
+	info("查询 SuperPod 内网 IP...")
+	internalIP, err := ssh("hostname -I | awk '{print $1}'")
+	if err != nil || internalIP == "" {
+		fail(fmt.Sprintf("无法获取 SuperPod 内网 IP: %v", err))
+		os.Exit(1)
+	}
+	ok(fmt.Sprintf("内网 IP: %s", internalIP))
+
+	// 4. Find connect.exe
+	connectExe := findConnectExe()
+	if connectExe == "" {
+		fail("找不到 connect.exe（需要安装 Git for Windows）")
+		info("下载: https://git-scm.com/download/win")
+		os.Exit(1)
+	}
+
+	// 5. Ensure Windows SSH key exists and is authorized on SuperPod
+	sshUser := envOr("SUPERPOD_USER", "")
+	winPubKeyPath := filepath.Join(winSSHDir, "id_ed25519.pub")
+	if _, err := os.Stat(winPubKeyPath); err != nil {
+		// Try RSA
+		winPubKeyPath = filepath.Join(winSSHDir, "id_rsa.pub")
+	}
+	if pubKey, err := os.ReadFile(winPubKeyPath); err == nil {
+		key := strings.TrimSpace(string(pubKey))
+		// Check if already authorized
+		out, _ := ssh("grep -cF '" + strings.Split(key, " ")[1] + "' ~/.ssh/authorized_keys 2>/dev/null")
+		if out == "0" || out == "" {
+			info("添加 Windows SSH 公钥到 SuperPod...")
+			if _, err := ssh("mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '" + key + "' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"); err != nil {
+				warn(fmt.Sprintf("公钥添加失败: %v（可能需要手动添加）", err))
+			} else {
+				ok("Windows SSH 公钥已添加")
+			}
+		} else {
+			ok("Windows SSH 公钥已授权")
+		}
+	} else {
+		warn(fmt.Sprintf("找不到 Windows SSH 公钥 (%s)，VS Code 连接时可能需要密码", winSSHDir))
+		info("建议在 Windows PowerShell 中运行: ssh-keygen -t ed25519")
+	}
+
+	// 6. Write/update Windows SSH config
+	desired := fmt.Sprintf(`Host superpod
+    HostName %s
+    User %s
+    ProxyCommand "%s" -S 127.0.0.1:%s %%h %%p
+    ServerAliveInterval 15
+    ServerAliveCountMax 4`, internalIP, sshUser, connectExe, socksPort)
+
+	os.MkdirAll(winSSHDir, 0700)
+	existing, _ := os.ReadFile(winConfigPath)
+	content := string(existing)
+
+	if strings.Contains(content, "Host superpod") {
+		// Replace existing block
+		lines := strings.Split(content, "\n")
+		var result []string
+		inBlock := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "Host superpod" || strings.HasPrefix(trimmed, "Host superpod ") ||
+				trimmed == "Host superpod.ust.hk superpod" {
+				inBlock = true
+				continue
+			}
+			if inBlock && (strings.HasPrefix(trimmed, "Host ") || trimmed == "") {
+				if trimmed == "" {
+					continue // skip blank lines after block
+				}
+				inBlock = false
+			}
+			if !inBlock {
+				result = append(result, line)
+			}
+		}
+		cleaned := strings.TrimRight(strings.Join(result, "\n"), "\n\r\t ")
+		if cleaned != "" {
+			cleaned += "\n\n"
+		}
+		content = cleaned + desired + "\n"
+	} else {
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if content != "" {
+			content += "\n"
+		}
+		content += desired + "\n"
+	}
+
+	if err := os.WriteFile(winConfigPath, []byte(content), 0600); err != nil {
+		fail(fmt.Sprintf("写入 Windows SSH 配置失败: %v", err))
+		os.Exit(1)
+	}
+	ok(fmt.Sprintf("Windows SSH 配置已写入 C:\\Users\\%s\\.ssh\\config", winUser))
+
+	fmt.Println()
+	info("VS Code 连接方式:")
+	info("  1. 安装 Remote-SSH 扩展")
+	info("  2. Ctrl+Shift+P → Remote-SSH: Connect to Host → superpod")
+	info(fmt.Sprintf("  （确保 WSL 中 SOCKS 代理运行: spod socks）"))
+}
+
 // ── VPN ──
 
 var vpnPIDFile = filepath.Join(os.TempDir(), "spod-vpn.pid")
@@ -1289,6 +1443,7 @@ func cmdHelp() {
 		{"spod socks", "启动 SOCKS5 代理（Windows 可用）"},
 		{"spod socks stop", "关闭 SOCKS5 代理"},
 		{"spod socks status", "查看 SOCKS5 代理状态"},
+		{"spod vscode", "配置 Windows VS Code Remote-SSH"},
 		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
@@ -1348,6 +1503,8 @@ func main() {
 		default:
 			ensureSocks()
 		}
+	case "vscode":
+		cmdVscode()
 	case "ls":
 		ensureTunnel()
 		cmdLs()
