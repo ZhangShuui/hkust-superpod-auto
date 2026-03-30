@@ -239,27 +239,52 @@ func sanitizeName(name string) string {
 
 // ── SSH/shell helpers ──
 
+// isSSHConnErr returns true for SSH exit code 255 (connection-level failure).
+func isSSHConnErr(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 255
+}
+
 func ssh(args ...string) (string, error) {
-	cmd := exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	const maxRetries = 3
+	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for attempt := 0; ; attempt++ {
+		cmd := exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		if err == nil {
+			return strings.TrimSpace(stdout.String()), nil
+		}
+		if isSSHConnErr(err) && attempt < maxRetries {
+			warn(fmt.Sprintf("SSH 连接被重置，%v 后重试 (%d/%d)...", delays[attempt], attempt+1, maxRetries))
+			time.Sleep(delays[attempt])
+			continue
+		}
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg != "" {
 			return strings.TrimSpace(stdout.String()), fmt.Errorf("%w: %s", err, errMsg)
 		}
 		return strings.TrimSpace(stdout.String()), err
 	}
-	return strings.TrimSpace(stdout.String()), nil
 }
 
 func sshInteractive(args ...string) error {
-	cmd := exec.Command("ssh", append([]string{"-t", "-o", "ConnectTimeout=10", host}, args...)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	const maxRetries = 3
+	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for attempt := 0; ; attempt++ {
+		cmd := exec.Command("ssh", append([]string{"-t", "-o", "ConnectTimeout=10", host}, args...)...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		if err == nil || !isSSHConnErr(err) || attempt >= maxRetries {
+			return err
+		}
+		warn(fmt.Sprintf("SSH 连接被重置，%v 后重试 (%d/%d)...", delays[attempt], attempt+1, maxRetries))
+		time.Sleep(delays[attempt])
+	}
 }
 
 // ── Tunnel ──
@@ -1091,22 +1116,28 @@ func ensureTmuxConf() {
 }
 
 func ensureRemoteProxy() {
-	// Ensure proxy env vars in remote ~/.bashrc so both Claude Code and Codex
-	// can reach their APIs through the reverse tunnel → local Clash proxy.
-	marker := "# spod-proxy"
+	// Set up shell wrapper functions for claude/codex so ONLY their processes
+	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
+	beginMarker := "# spod-proxy-begin"
+	endMarker := "# spod-proxy-end"
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", tunnelPort)
+
+	// Remove ALL old proxy config: marker blocks, bare export lines, and _spod_proxy var.
 	script := fmt.Sprintf(
-		`grep -q '%s' ~/.bashrc 2>/dev/null || cat >> ~/.bashrc << 'SPOD_EOF'
+		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d' ~/.bashrc 2>/dev/null
+cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
-export http_proxy=%s
-export https_proxy=%s
-export HTTP_PROXY=%s
-export HTTPS_PROXY=%s
+_spod_proxy="%s"
+claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
+codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
+%s
 SPOD_EOF`,
-		marker, marker, proxyURL, proxyURL, proxyURL, proxyURL,
+		beginMarker, proxyURL, endMarker,
 	)
-	ssh(script)
+	if _, err := ssh(script); err != nil {
+		warn("代理配置写入失败（将在连接后重试）")
+	}
 }
 
 func attachOrCreate(name string) {
@@ -1116,7 +1147,8 @@ func attachOrCreate(name string) {
 	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
-			fail("SSH 连接断开")
+			fail("SSH 连接失败")
+			fail("请检查 VPN 连接: spod vpn status")
 			os.Exit(1)
 		} else if !errors.As(err, &exitErr) {
 			fail(fmt.Sprintf("执行失败: %v", err))
@@ -1149,7 +1181,8 @@ func cmdNew(name string) {
 	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
-			fail("SSH 连接断开")
+			fail("SSH 连接失败")
+			fail("请检查 VPN 连接: spod vpn status")
 			os.Exit(1)
 		} else if !errors.As(err, &exitErr) {
 			fail(fmt.Sprintf("执行失败: %v", err))
