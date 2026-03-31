@@ -22,6 +22,7 @@ var (
 	tunnelPort = envOr("TUNNEL_PORT", "17897")
 	localPort  = envOr("CLASH_PORT", "7897")
 	socksPort  = envOr("SOCKS_PORT", "1080")
+	relayPort  = "" // computed in init(): tunnelPort + 1
 	prefix     = "spod"
 	vpnScript  = "" // resolved in init()
 )
@@ -34,6 +35,10 @@ func envOr(key, fallback string) string {
 }
 
 func init() {
+	// Default relay port before .env is loaded
+	tp, _ := strconv.Atoi(tunnelPort)
+	relayPort = strconv.Itoa(tp + 1)
+
 	// Load .env from project root (walk up from executable or cwd)
 	for _, base := range []string{os.Getenv("SPOD_ENV_FILE"), findDotenv()} {
 		if base == "" {
@@ -73,6 +78,8 @@ func init() {
 		tunnelPort = envOr("TUNNEL_PORT", "17897")
 		localPort = envOr("CLASH_PORT", "7897")
 		socksPort = envOr("SOCKS_PORT", "1080")
+		tp, _ := strconv.Atoi(tunnelPort)
+		relayPort = strconv.Itoa(tp + 1)
 		break
 	}
 
@@ -1269,19 +1276,113 @@ func ensureTmuxConf() {
 	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
 }
 
+// relayScript is a TCP relay proxy with retry, deployed to SuperPod.
+// It sits between claude/codex and the SSH tunnel, absorbing short outages
+// by retrying upstream connections instead of immediately failing.
+const relayScript = `#!/usr/bin/env python3
+import socket,threading,time,sys,signal,os
+UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
+LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
+RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
+def relay(s,d):
+    try:
+        while True:
+            b=s.recv(65536)
+            if not b:break
+            d.sendall(b)
+    except:pass
+    finally:
+        try:s.close()
+        except:pass
+        try:d.close()
+        except:pass
+def handle(c):
+    end=time.time()+RETRY_SEC;n=0;delay=3
+    while time.time()<end:
+        try:
+            u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3);break
+        except:
+            n+=1;time.sleep(delay);delay=min(delay*2,30)
+    else:
+        if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
+        c.close();return
+    if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
+    a=threading.Thread(target=relay,args=(c,u),daemon=True)
+    b=threading.Thread(target=relay,args=(u,c),daemon=True)
+    a.start();b.start();a.join();b.join()
+signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
+srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+srv.bind(("127.0.0.1",LISTEN));srv.listen(64)
+if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT}",flush=True)
+# Write PID file
+with open(os.path.expanduser(f"~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
+while True:
+    c,_=srv.accept()
+    threading.Thread(target=handle,args=(c,),daemon=True).start()
+`
+
+func ensureRelay() {
+	// Deploy and start the TCP relay on SuperPod.
+	// Always writes the latest script; restarts only if script changed or not running.
+	script := fmt.Sprintf(
+		`mkdir -p ~/.local/bin ~/.local/share
+NEW_SCRIPT=$(cat << 'RELAY_SCRIPT'
+%s
+RELAY_SCRIPT
+)
+OLD_SCRIPT=""
+[ -f ~/.local/bin/spod-relay.py ] && OLD_SCRIPT=$(cat ~/.local/bin/spod-relay.py)
+if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+    echo "running"
+else
+    # Kill old relay if running
+    pkill -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
+    echo "$NEW_SCRIPT" > ~/.local/bin/spod-relay.py
+    chmod +x ~/.local/bin/spod-relay.py
+    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay.log 2>&1 &
+    sleep 0.5
+    if pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+        echo "started"
+    else
+        echo "failed"
+    fi
+fi`,
+		relayScript,
+		tunnelPort, relayPort,
+		tunnelPort, relayPort,
+		tunnelPort, relayPort,
+	)
+	out, err := ssh(script)
+	if err != nil {
+		warn(fmt.Sprintf("Relay 部署失败: %v", err))
+		return
+	}
+	switch strings.TrimSpace(out) {
+	case "running":
+		// silent — already running
+	case "started":
+		ok(fmt.Sprintf("Relay 已启动 (:%s → :%s，隧道断开时自动等待重连)", relayPort, tunnelPort))
+	case "failed":
+		warn("Relay 启动失败，查看日志: /tmp/spod-relay.log")
+	}
+}
+
 func ensureRemoteProxy() {
 	// Set up shell wrapper functions for claude/codex so ONLY their processes
 	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
+	// Points to the relay port (not tunnel directly) for outage resilience.
 	beginMarker := "# spod-proxy-begin"
 	endMarker := "# spod-proxy-end"
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", tunnelPort)
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
 
 	// Remove ALL old proxy config: marker blocks, bare export lines, and _spod_proxy var.
 	script := fmt.Sprintf(
-		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d' ~/.bashrc 2>/dev/null
+		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
 cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
 _spod_proxy="%s"
 claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
 codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
@@ -1296,6 +1397,7 @@ SPOD_EOF`,
 
 func attachOrCreate(name string) {
 	ensureTmuxConf()
+	ensureRelay()
 	ensureRemoteProxy()
 	info(fmt.Sprintf("连接到 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
@@ -1330,6 +1432,7 @@ func cmdNew(name string) {
 		name = fullName(name)
 	}
 	ensureTmuxConf()
+	ensureRelay()
 	ensureRemoteProxy()
 	info(fmt.Sprintf("创建会话 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
