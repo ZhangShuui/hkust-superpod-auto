@@ -65,7 +65,7 @@ LOGIN_TIMEOUT = 180          # 3 min overall login timeout
 MAX_CONSECUTIVE_FAILURES = 5
 BACKOFF_BASE = 10            # seconds
 BACKOFF_CAP = 300            # 5 minutes
-HEALTH_CHECK_INTERVAL = 60   # seconds
+HEALTH_CHECK_INTERVAL = 600  # seconds (10 min — avoid hammering SuperPod SSH)
 
 # ─── Logging ──────────────────────────────────────────────────────────
 
@@ -425,34 +425,85 @@ def dns_query_udp(hostname, dns_server, timeout=5):
         s.close()
 
 
-def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=10):
+DNS_CACHE_FILE = Path(__file__).resolve().parent / ".dns-cache.json"
+
+
+def _load_dns_cache():
+    """Load cached host→IP mappings."""
+    try:
+        import json
+        return json.loads(DNS_CACHE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_dns_cache(cache):
+    """Save host→IP mappings to cache file."""
+    try:
+        import json
+        DNS_CACHE_FILE.write_text(json.dumps(cache, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def _apply_dns_entry(host, ip, sudo_password):
+    """Write /etc/hosts entry and add route via tun0."""
+    marker = f"# hkust-vpn {host}"
+    cmd = (
+        f"sed -i '/{marker}/d' /etc/hosts && "
+        f"echo '{ip} {host}  {marker}' >> /etc/hosts && "
+        f"ip route replace {ip}/32 dev tun0"
+    )
+    subprocess.run(
+        ["sudo", "-S", "bash", "-c", cmd],
+        input=(sudo_password + "\n").encode(),
+        capture_output=True,
+    )
+
+
+def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=15):
     """Resolve hosts via VPN DNS and add /etc/hosts entries + routes.
 
     vpn-slice can't resolve correctly when Clash intercepts DNS, so we
     do it manually after the tunnel is up.
+
+    Uses a local cache file (.dns-cache.json) to skip DNS queries for
+    hosts with known stable IPs (e.g. university HPC clusters).
     """
+    cache = _load_dns_cache()
     resolved = set()
+
+    # Fast path: apply cached IPs immediately (no DNS query needed)
+    for host in hosts:
+        if host in cache:
+            ip = cache[host]
+            _apply_dns_entry(host, ip, sudo_password)
+            log.info(f"[+] DNS fix: {host} -> {ip} (cached, route via tun0)")
+            resolved.add(host)
+
+    if resolved == set(hosts):
+        return True
+
+    # Slow path: query VPN DNS for uncached hosts
+    remaining = [h for h in hosts if h not in resolved]
+    log.info(f"[*] DNS fix: resolving {', '.join(remaining)} via {vpn_dns}")
     for attempt in range(retries):
-        time.sleep(3)
-        for host in hosts:
+        if attempt > 0:
+            time.sleep(2)
+        for host in remaining:
             if host in resolved:
                 continue
             ip = dns_query_udp(host, vpn_dns)
-            if ip:
-                marker = f"# hkust-vpn {host}"
-                # Remove old entry, add fresh one, add route
-                cmd = (
-                    f"sed -i '/{marker}/d' /etc/hosts && "
-                    f"echo '{ip} {host}  {marker}' >> /etc/hosts && "
-                    f"ip route replace {ip}/32 dev tun0"
-                )
-                subprocess.run(
-                    ["sudo", "-S", "bash", "-c", cmd],
-                    input=(sudo_password + "\n").encode(),
-                    capture_output=True,
-                )
-                log.info(f"[+] DNS fix: {host} -> {ip} (route via tun0)")
-                resolved.add(host)
+            if not ip:
+                if attempt > 0 and attempt % 3 == 0:
+                    log.info(f"[*] DNS fix: waiting for {host} ({attempt}/{retries})...")
+                continue
+            _apply_dns_entry(host, ip, sudo_password)
+            log.info(f"[+] DNS fix: {host} -> {ip} (route via tun0)")
+            resolved.add(host)
+            # Cache the resolved IP
+            cache[host] = ip
+            _save_dns_cache(cache)
         if resolved == set(hosts):
             return True
     if not resolved:
@@ -461,8 +512,16 @@ def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=10):
 
 
 def _health_check(hosts, interval=HEALTH_CHECK_INTERVAL):
-    """Periodically verify VPN tunnel passes traffic."""
-    time.sleep(30)  # give tunnel time to establish
+    """Periodically verify VPN tunnel passes traffic.
+
+    Uses exponential backoff on failure (5min → 10min → 15min cap) to avoid
+    hammering SuperPod SSH when the server is down. Logs failures but does NOT
+    auto-kill openconnect — that caused reconnect storms that overloaded the
+    login service.
+    """
+    time.sleep(60)  # give tunnel time to fully establish
+    backoff = interval
+    max_backoff = 1800  # 30 minutes
     while True:
         reachable = False
         for host in hosts:
@@ -473,15 +532,52 @@ def _health_check(hosts, interval=HEALTH_CHECK_INTERVAL):
                 break
             except (socket.timeout, OSError):
                 continue
-        if not reachable:
-            log.warning(f"[!] Health check FAILED: none of {hosts} reachable on port 22")
-        time.sleep(interval)
+        if reachable:
+            backoff = interval  # reset on success
+            time.sleep(interval)
+        else:
+            log.warning(f"[!] Health check FAILED: none of {hosts} reachable on port 22 (next check in {backoff}s)")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+
+def _cleanup_vpn_state(sudo_password):
+    """Clean up stale VPN state before (re)connecting.
+
+    Flushes accumulated iptables/nftables rules for tun0, clears
+    conntrack entries for the VPN subnet, and removes stale tun0.
+    Without this, repeated reconnects accumulate DROP rules that
+    block new TCP connections even though ICMP ping works.
+    """
+    cleanup_cmds = [
+        # Flush tun0-related iptables rules (nft backend)
+        "nft flush chain ip filter INPUT 2>/dev/null; "
+        "nft add rule ip filter INPUT counter jump ts-input 2>/dev/null",
+        # Also try legacy iptables
+        "while iptables -D INPUT -i tun0 -j DROP 2>/dev/null; do :; done",
+        "while iptables -D INPUT -i tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done",
+        # Flush conntrack entries for HKUST subnet
+        "conntrack -D -s 143.89.0.0/16 2>/dev/null; "
+        "conntrack -D -d 143.89.0.0/16 2>/dev/null",
+        # Remove stale tun0 if exists
+        "ip link delete tun0 2>/dev/null",
+    ]
+    for cmd in cleanup_cmds:
+        subprocess.run(
+            ["sudo", "-S", "bash", "-c", cmd],
+            input=(sudo_password + "\n").encode() if sudo_password else None,
+            capture_output=True,
+        )
+    log.info("[+] Cleaned up stale VPN state (iptables, conntrack, tun0)")
 
 
 def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
     """Launch openconnect with the DSID cookie and vpn-slice."""
     hosts = hosts or DEFAULT_HOSTS
     vpn_slice_arg = VPN_SLICE_PATH + " " + " ".join(hosts)
+
+    # Clean stale state from previous connections
+    _cleanup_vpn_state(sudo_password)
 
     cmd = [
         "sudo", "-S",  # read password from stdin

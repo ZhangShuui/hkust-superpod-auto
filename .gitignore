@@ -7,6 +7,7 @@ __pycache__/
 uv.lock
 .env
 vpn.log*
+.dns-cache.json
 
 # Go build output
 cmd/spod/spod

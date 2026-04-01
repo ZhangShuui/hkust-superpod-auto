@@ -327,10 +327,10 @@ func tunnelPID() int {
 }
 
 func ensureVPN() {
-	if vpnIsUp() {
+	if vpnTunnelUp() {
 		return
 	}
-	fail("VPN 未连接 — SuperPod 不可达 (:22)")
+	fail("VPN 未连接 — tun0 不存在")
 	info("运行 `spod vpn` 启动 VPN")
 	os.Exit(1)
 }
@@ -738,9 +738,18 @@ func vpnPID() int {
 	return pid
 }
 
+func vpnTunnelUp() bool {
+	// Cheap check: tun0 interface exists. No network traffic.
+	_, err := net.InterfaceByName("tun0")
+	return err == nil
+}
+
 func vpnIsUp() bool {
-	// Quick check: can we reach superpod.ust.hk on SSH port?
-	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", 3*time.Second)
+	// Expensive check: TCP connect to SuperPod :22. Use sparingly.
+	if !vpnTunnelUp() {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -817,15 +826,15 @@ func cmdVpnStart() {
 		}
 	}
 
-	// Fallback: inline spinner
-	info("等待 VPN 连接建立...")
+	// Fallback: inline spinner — check tun0 only, no TCP :22 spam
+	info("等待 VPN 隧道建立...")
 	deadline := time.Now().Add(90 * time.Second)
 	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	i := 0
 	for time.Now().Before(deadline) {
-		if vpnIsUp() {
+		if vpnTunnelUp() {
 			fmt.Printf("\r\033[2K")
-			ok("\\(ᵔᵕᵔ)/  VPN 已连接！")
+			ok("\\(ᵔᵕᵔ)/  VPN 隧道已建立！")
 			if logFile != nil {
 				logFile.Close()
 			}
@@ -833,7 +842,7 @@ func cmdVpnStart() {
 		}
 		fmt.Printf("\r  %s ( •_•) 连接中...", spin[i%len(spin)])
 		i++
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 	fmt.Printf("\r\033[2K")
 	warn("( ×_×)  VPN 进程已启动但连接尚未就绪")
@@ -864,6 +873,20 @@ func cmdVpnStop() {
 	ok(fmt.Sprintf("VPN 已停止 (pid=%d)", pid))
 }
 
+func cmdVpnRestart() {
+	info("重启 VPN...")
+	cmdVpnStop()
+	// Wait for tun0 to be cleaned up
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := net.InterfaceByName("tun0"); err != nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	cmdVpnStart()
+}
+
 func cmdVpnStatus() {
 	pid := vpnPID()
 	if pid > 0 {
@@ -883,7 +906,7 @@ func cmdVpnWidget() {
 	// --color flag enables ANSI colors
 	color := len(os.Args) > 3 && os.Args[3] == "--color"
 	pid := vpnPID()
-	if pid > 0 && vpnIsUp() {
+	if pid > 0 && vpnTunnelUp() {
 		if color {
 			fmt.Print("\033[32mᕕ(ᐛ)ᕗ ✔\033[0m")
 		} else {
@@ -917,6 +940,7 @@ func cmdVpnWatch() {
 		{"   ( ˘▽˘)っ♨  ", "TOTP 验证"},
 		{"   ᕕ( ᐛ )ᕗ   ", "建立隧道"},
 		{"   ᕕ( ᐛ )ᕗ   ", "DNS 修复"},
+		{"   ᕕ( ᐛ )ᕗ   ", "DNS 查询中..."},
 	}
 	celebrateFrame := frame{"   \\(ᵔᵕᵔ)/   ", "VPN 已连接"}
 	idleFrames := []frame{
@@ -928,7 +952,7 @@ func cmdVpnWatch() {
 	disconnectedFrame := frame{"    ( ×_×)    ", " VPN 未连接"}
 
 	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	bars := []string{"○ ○ ○ ○ ○", "● ○ ○ ○ ○", "● ● ○ ○ ○", "● ● ● ○ ○", "● ● ● ● ○", "● ● ● ● ◐"}
+	bars := []string{"○ ○ ○ ○ ○", "● ○ ○ ○ ○", "● ● ○ ○ ○", "● ● ● ○ ○", "● ● ● ● ○", "● ● ● ● ◐", "● ● ● ● ◐"}
 
 	// Parse VPN log to detect current step
 	logPath := ""
@@ -937,6 +961,7 @@ func cmdVpnWatch() {
 	}
 
 	currentStep := 0
+	dnsDetail := ""
 	var mu sync.Mutex
 
 	if logPath != "" {
@@ -958,6 +983,23 @@ func cmdVpnWatch() {
 					currentStep = 3
 				case strings.Contains(line, "Step 5/5"), strings.Contains(line, "Connecting VPN"):
 					currentStep = 4
+				case strings.Contains(line, "DNS fix") && strings.Contains(line, "cached"):
+					currentStep = 5
+					dnsDetail = "缓存命中"
+				case strings.Contains(line, "DNS fix") && strings.Contains(line, "waiting"):
+					currentStep = 6
+					// Extract retry info from log like "waiting for host (3/15)..."
+					if idx := strings.Index(line, "("); idx >= 0 {
+						if end := strings.Index(line[idx:], ")"); end >= 0 {
+							dnsDetail = "重试 " + line[idx:idx+end+1]
+						}
+					}
+				case strings.Contains(line, "DNS fix") && strings.Contains(line, "route via tun0"):
+					currentStep = 7 // DNS done
+					dnsDetail = ""
+				case strings.Contains(line, "DNS fix") && strings.Contains(line, "resolving"):
+					currentStep = 6
+					dnsDetail = "查询中"
 				case strings.Contains(line, "DNS fix"):
 					currentStep = 5
 				case strings.Contains(line, "session #"):
@@ -968,19 +1010,26 @@ func cmdVpnWatch() {
 		}()
 	}
 
-	// Background connectivity probe (vpnIsUp has 3s timeout, can't call in render loop)
+	// Background connectivity probe — tun0 check is cheap (no network traffic).
+	// TCP :22 check only once per 60s to avoid hammering SuperPod.
 	var isUp bool
+	var lastTCPCheck time.Time
 	go func() {
 		for {
-			up := vpnIsUp()
+			tunnelUp := vpnTunnelUp()
+			up := false
+			if tunnelUp && time.Since(lastTCPCheck) >= 5*time.Minute {
+				up = vpnIsUp()
+				lastTCPCheck = time.Now()
+			} else if tunnelUp {
+				mu.Lock()
+				up = isUp // keep last known TCP state between checks
+				mu.Unlock()
+			}
 			mu.Lock()
 			isUp = up
 			mu.Unlock()
-			if up {
-				time.Sleep(5 * time.Second)
-			} else {
-				time.Sleep(2 * time.Second)
-			}
+			time.Sleep(5 * time.Second)
 		}
 	}()
 
@@ -996,6 +1045,7 @@ func cmdVpnWatch() {
 		mu.Lock()
 		up := isUp
 		s := currentStep
+		dd := dnsDetail
 		mu.Unlock()
 
 		// Track when connection was established
@@ -1016,7 +1066,11 @@ func cmdVpnWatch() {
 			}
 			fmt.Printf("\n  \033[32m%s\033[0m\n", f.art)
 			fmt.Printf("  \033[32m  ● ● ● ● ●  \033[0m\n\n")
-			fmt.Printf("  \033[32m  %s\033[0m\n", f.label)
+			label := f.label
+			if s == 6 && dd != "" {
+				label += fmt.Sprintf("  \033[33m(DNS %s)\033[0m", dd)
+			}
+			fmt.Printf("  \033[32m  %s\033[0m\n", label)
 		} else if pid > 0 {
 			if s >= len(connecting) {
 				s = len(connecting) - 1
@@ -1539,6 +1593,7 @@ func cmdHelp() {
 		{"spod killall", "关掉所有会话"},
 		{"spod vpn", "启动 VPN（后台 headless）"},
 		{"spod vpn stop", "停止 VPN"},
+		{"spod vpn restart", "重启 VPN"},
 		{"spod vpn status", "查看 VPN + SuperPod 状态"},
 		{"spod vpn log", "实时查看 VPN 日志"},
 		{"spod tunnel", "启动 / 检查 SSH 隧道"},
@@ -1576,6 +1631,8 @@ func main() {
 		switch sub {
 		case "stop":
 			cmdVpnStop()
+		case "restart":
+			cmdVpnRestart()
 		case "status":
 			cmdVpnStatus()
 		case "log":
