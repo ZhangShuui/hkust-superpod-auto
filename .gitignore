@@ -13,3 +13,10 @@ vpn.log*
 cmd/spod/spod
 sync.sh
 speedtest.sh
+
+# Debug / temp
+mfa-debug.*
+superpod-*.txt
+
+# Claude Code
+.claude/
