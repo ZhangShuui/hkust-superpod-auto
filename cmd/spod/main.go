@@ -129,6 +129,11 @@ func ensureSSHConfig() {
     HostName %s
     User %s
 
+    # 连接复用：避免多次 SSH 握手触发服务端限流
+    ControlMaster auto
+    ControlPath /tmp/spod-ssh-%%r@%%h:%%p
+    ControlPersist 300
+
     # 心跳：每 15s 发一次，连续 4 次无响应才断（容忍 60s 网络抖动）
     ServerAliveInterval 15
     ServerAliveCountMax 4
@@ -138,20 +143,14 @@ func ensureSSHConfig() {
 	existing, _ := os.ReadFile(configPath)
 	content := string(existing)
 
-	// Check if superpod block exists
+	// Check if superpod block exists and is up to date
 	if strings.Contains(content, "Host superpod") {
-		// Extract current User from existing block
-		for _, line := range strings.Split(content, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "User ") {
-				currentUser := strings.TrimPrefix(line, "User ")
-				if currentUser == sshUser {
-					return // already correct
-				}
-				break
-			}
+		// Check if config already matches desired
+		if strings.Contains(content, "ControlMaster auto") &&
+			strings.Contains(content, "User "+sshUser) {
+			return // already correct
 		}
-		// User mismatch — replace the whole superpod block
+		// Config outdated — replace the whole superpod block
 		// Find block boundaries (from "Host superpod" to next "Host " or EOF)
 		lines := strings.Split(content, "\n")
 		var result []string
@@ -255,8 +254,19 @@ func isSSHConnErr(err error) bool {
 func ssh(args ...string) (string, error) {
 	const maxRetries = 3
 	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	// For multi-line scripts, use stdin instead of command argument.
+	// SSH's remote bash -c has issues with heredocs passed as arguments.
+	useStdin := len(args) == 1 && strings.Contains(args[0], "\n")
+
 	for attempt := 0; ; attempt++ {
-		cmd := exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+		var cmd *exec.Cmd
+		if useStdin {
+			cmd = exec.Command("ssh", "-o", "ConnectTimeout=5", host, "bash -s")
+			cmd.Stdin = strings.NewReader(args[0])
+		} else {
+			cmd = exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -352,8 +362,16 @@ func ensureTunnel() {
 
 	pid := tunnelPID()
 	if pid > 0 {
-		ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
-		return
+		// PID exists — verify the underlying SSH connection is still alive
+		probe := exec.Command("ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", host, "true")
+		if err := probe.Run(); err != nil {
+			warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
+			syscall.Kill(pid, syscall.SIGTERM)
+			time.Sleep(1 * time.Second)
+		} else {
+			ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
+			return
+		}
 	}
 
 	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
@@ -369,6 +387,7 @@ func ensureTunnel() {
 		"-o", "ServerAliveCountMax=4",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
+		"-o", "ControlMaster=no",
 		"-R", fmt.Sprintf("%s:127.0.0.1:%s", tunnelPort, localPort),
 		host,
 	)
@@ -487,6 +506,7 @@ func ensureSocks() {
 		"-o", "ServerAliveCountMax=4",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
+		"-o", "ControlMaster=no",
 		"-D", fmt.Sprintf("0.0.0.0:%s", socksPort),
 		host,
 	)
@@ -1014,17 +1034,32 @@ func cmdVpnWatch() {
 	// TCP :22 check only once per 60s to avoid hammering SuperPod.
 	var isUp bool
 	var lastTCPCheck time.Time
+	var wasTunnelUp bool
+	var tcpInterval = 30 * time.Second // start fast, back off on success
+	const tcpIntervalMax = 5 * time.Minute
 	go func() {
 		for {
 			tunnelUp := vpnTunnelUp()
 			up := false
-			if tunnelUp && time.Since(lastTCPCheck) >= 5*time.Minute {
+			justConnected := tunnelUp && !wasTunnelUp
+			if tunnelUp && (justConnected || time.Since(lastTCPCheck) >= tcpInterval) {
 				up = vpnIsUp()
 				lastTCPCheck = time.Now()
+				if up {
+					// Connected — slow down probes
+					tcpInterval = min(tcpInterval*2, tcpIntervalMax)
+				} else {
+					// Not reachable — keep at 30s to detect recovery promptly
+					tcpInterval = 30 * time.Second
+				}
 			} else if tunnelUp {
 				mu.Lock()
-				up = isUp // keep last known TCP state between checks
+				up = isUp
 				mu.Unlock()
+			}
+			wasTunnelUp = tunnelUp
+			if !tunnelUp {
+				tcpInterval = 30 * time.Second // reset on disconnect
 			}
 			mu.Lock()
 			isUp = up
@@ -1271,12 +1306,20 @@ func listRemoteSessions() ([]session, error) {
 	return sessions, nil
 }
 
+var cachedSessions []session
+var sessionsCached bool
+
 func mustListSessions() []session {
+	if sessionsCached {
+		return cachedSessions
+	}
 	sessions, err := listRemoteSessions()
 	if err != nil {
 		fail(err.Error())
 		os.Exit(1)
 	}
+	cachedSessions = sessions
+	sessionsCached = true
 	return sessions
 }
 
@@ -1326,8 +1369,34 @@ func printSessions(sessions []session) {
 }
 
 func ensureTmuxConf() {
-	// Ensure mouse mode is enabled in remote ~/.tmux.conf
+	// Combined with ensureRemoteProxy into one SSH call when possible.
+	// Kept as standalone for backwards compat.
 	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
+}
+
+func ensureTmuxConfAndProxy() {
+	// Combine tmux conf + proxy config into a single SSH call to reduce connections.
+	beginMarker := "# spod-proxy-begin"
+	endMarker := "# spod-proxy-end"
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
+
+	script := fmt.Sprintf(
+		`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf
+sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+cat >> ~/.bashrc << 'SPOD_EOF'
+
+%s
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
+_spod_proxy="%s"
+claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
+codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
+%s
+SPOD_EOF`,
+		beginMarker, proxyURL, endMarker,
+	)
+	if _, err := ssh(script); err != nil {
+		warn("远程配置写入失败（将在连接后重试）")
+	}
 }
 
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
@@ -1449,10 +1518,14 @@ SPOD_EOF`,
 	}
 }
 
-func attachOrCreate(name string) {
-	ensureTmuxConf()
+func ensureRemoteSetup() {
+	// Minimal SSH calls: tmux+proxy combined (1 call) + relay (1 call)
+	ensureTmuxConfAndProxy()
 	ensureRelay()
-	ensureRemoteProxy()
+}
+
+func attachOrCreate(name string) {
+	ensureRemoteSetup()
 	info(fmt.Sprintf("连接到 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux attach -t %s 2>/dev/null || tmux new -s %s", name, name)); err != nil {
 		var exitErr *exec.ExitError
@@ -1485,9 +1558,7 @@ func cmdNew(name string) {
 	} else {
 		name = fullName(name)
 	}
-	ensureTmuxConf()
-	ensureRelay()
-	ensureRemoteProxy()
+	ensureRemoteSetup()
 	info(fmt.Sprintf("创建会话 %s%s%s ...", bold, name, reset))
 	if err := sshInteractive(fmt.Sprintf("tmux new -s %s", name)); err != nil {
 		var exitErr *exec.ExitError
