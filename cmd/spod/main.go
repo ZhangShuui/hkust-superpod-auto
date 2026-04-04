@@ -22,7 +22,7 @@ var (
 	tunnelPort = envOr("TUNNEL_PORT", "17897")
 	localPort  = envOr("CLASH_PORT", "7897")
 	socksPort  = envOr("SOCKS_PORT", "1080")
-	relayPort  = "" // computed in init(): tunnelPort + 1
+	relayPort  = "" // computed in ensureRelay(): tunnelPort + remoteUID%1000 + 1
 	prefix     = "spod"
 	vpnScript  = "" // resolved in init()
 )
@@ -35,10 +35,6 @@ func envOr(key, fallback string) string {
 }
 
 func init() {
-	// Default relay port before .env is loaded
-	tp, _ := strconv.Atoi(tunnelPort)
-	relayPort = strconv.Itoa(tp + 1)
-
 	// Load .env from project root (walk up from executable or cwd)
 	for _, base := range []string{os.Getenv("SPOD_ENV_FILE"), findDotenv()} {
 		if base == "" {
@@ -78,8 +74,6 @@ func init() {
 		tunnelPort = envOr("TUNNEL_PORT", "17897")
 		localPort = envOr("CLASH_PORT", "7897")
 		socksPort = envOr("SOCKS_PORT", "1080")
-		tp, _ := strconv.Atoi(tunnelPort)
-		relayPort = strconv.Itoa(tp + 1)
 		break
 	}
 
@@ -1402,6 +1396,9 @@ SPOD_EOF`,
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
 // It sits between claude/codex and the SSH tunnel, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
+// relayScript listens on a per-user TCP port (tunnelPort + UID % 1000) to
+// avoid collisions on shared login nodes. Falls back to retrying upstream
+// when the SSH tunnel is temporarily down.
 const relayScript = `#!/usr/bin/env python3
 import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
@@ -1437,17 +1434,27 @@ signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 srv.bind(("127.0.0.1",LISTEN));srv.listen(64)
-if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT}",flush=True)
-# Write PID file
-with open(os.path.expanduser(f"~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
+if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT} (uid={os.getuid()})",flush=True)
+with open(os.path.expanduser("~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
 while True:
     c,_=srv.accept()
     threading.Thread(target=handle,args=(c,),daemon=True).start()
 `
 
 func ensureRelay() {
+	// Compute per-user relay port from remote UID to avoid collisions on shared nodes.
+	if relayPort == "" {
+		uidStr, err := ssh("id -u")
+		if err != nil {
+			warn("无法获取远程 UID，跳过 relay")
+			return
+		}
+		uid, _ := strconv.Atoi(strings.TrimSpace(uidStr))
+		tp, _ := strconv.Atoi(tunnelPort)
+		relayPort = strconv.Itoa(tp + (uid%1000) + 1)
+	}
+
 	// Deploy and start the TCP relay on SuperPod.
-	// Always writes the latest script; restarts only if script changed or not running.
 	script := fmt.Sprintf(
 		`mkdir -p ~/.local/bin ~/.local/share
 NEW_SCRIPT=$(cat << 'RELAY_SCRIPT'
@@ -1456,16 +1463,15 @@ RELAY_SCRIPT
 )
 OLD_SCRIPT=""
 [ -f ~/.local/bin/spod-relay.py ] && OLD_SCRIPT=$(cat ~/.local/bin/spod-relay.py)
-if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -u $(id -u) -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
     echo "running"
 else
-    # Kill old relay if running
-    pkill -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
+    pkill -u $(id -u) -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
     echo "$NEW_SCRIPT" > ~/.local/bin/spod-relay.py
     chmod +x ~/.local/bin/spod-relay.py
-    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay.log 2>&1 &
+    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay-$(id -u).log 2>&1 &
     sleep 0.5
-    if pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+    if pgrep -u $(id -u) -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
         echo "started"
     else
         echo "failed"
@@ -1519,9 +1525,9 @@ SPOD_EOF`,
 }
 
 func ensureRemoteSetup() {
-	// Minimal SSH calls: tmux+proxy combined (1 call) + relay (1 call)
-	ensureTmuxConfAndProxy()
+	// Relay first (computes per-user relay port), then proxy (uses that port)
 	ensureRelay()
+	ensureTmuxConfAndProxy()
 }
 
 func attachOrCreate(name string) {
@@ -1651,6 +1657,44 @@ func cmdInteractive() {
 	}
 }
 
+func cmdCreds() {
+	ensureVPN()
+	home, _ := os.UserHomeDir()
+	type credFile struct {
+		local  string
+		remote string
+	}
+	files := []credFile{
+		{filepath.Join(home, ".codex", "auth.json"), "~/.codex/auth.json"},
+		{filepath.Join(home, ".codex", "config.toml"), "~/.codex/config.toml"},
+		{filepath.Join(home, ".codex", ".credentials.json"), "~/.codex/.credentials.json"},
+		{filepath.Join(home, ".claude", ".credentials.json"), "~/.claude/.credentials.json"},
+	}
+
+	// Ensure remote dirs exist
+	ssh("mkdir -p ~/.codex ~/.claude")
+
+	synced := 0
+	for _, f := range files {
+		if _, err := os.Stat(f.local); err != nil {
+			continue
+		}
+		cmd := exec.Command("scp", "-o", "ConnectTimeout=5", f.local, host+":"+f.remote)
+		if err := cmd.Run(); err != nil {
+			warn(fmt.Sprintf("%s → 失败: %v", f.remote, err))
+		} else {
+			ok(fmt.Sprintf("%s → %s", filepath.Base(f.local), f.remote))
+			synced++
+		}
+	}
+	if synced == 0 {
+		warn("没有找到本地凭证文件")
+		info("先在本地运行 `codex login` 或 `claude login`")
+	} else {
+		ok(fmt.Sprintf("已同步 %d 个凭证文件到 SuperPod", synced))
+	}
+}
+
 func cmdHelp() {
 	fmt.Fprintf(os.Stderr, "\n  %s%sspod%s %s— SuperPod 会话管理%s\n\n", bold, cPurple, reset, cGray, reset)
 	fmt.Fprintf(os.Stderr, "  %s用法%s\n", bold, reset)
@@ -1677,6 +1721,7 @@ func cmdHelp() {
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
+		{"spod creds", "同步本地凭证到 SuperPod"},
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
@@ -1775,6 +1820,8 @@ func main() {
 			dur = args[1]
 		}
 		cmdSpeedtest(dur)
+	case "creds":
+		cmdCreds()
 	case "ssh":
 		ensureTunnel()
 		if err := sshInteractive(); err != nil {
