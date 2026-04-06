@@ -1372,21 +1372,21 @@ func ensureTmuxConfAndProxy() {
 	// Combine tmux conf + proxy config into a single SSH call to reduce connections.
 	beginMarker := "# spod-proxy-begin"
 	endMarker := "# spod-proxy-end"
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
-
 	script := fmt.Sprintf(
 		`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf
-sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
 cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
-_spod_proxy="%s"
-claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
-codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
+_spod_proxy="http://127.0.0.1:%s"
+_spod_claude_bin=$(which claude 2>/dev/null)
+_spod_codex_bin=$(which codex 2>/dev/null)
+claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_claude_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_codex_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
 %s
 SPOD_EOF`,
-		beginMarker, proxyURL, endMarker,
+		beginMarker, tunnelPort, endMarker,
 	)
 	if _, err := ssh(script); err != nil {
 		warn("远程配置写入失败（将在连接后重试）")
@@ -1500,24 +1500,24 @@ fi`,
 func ensureRemoteProxy() {
 	// Set up shell wrapper functions for claude/codex so ONLY their processes
 	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
-	// Points to the relay port (not tunnel directly) for outage resilience.
+	// Points directly to the SSH tunnel (not relay — relay adds latency/hangs under concurrent load).
 	beginMarker := "# spod-proxy-begin"
 	endMarker := "# spod-proxy-end"
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
 
-	// Remove ALL old proxy config: marker blocks, bare export lines, and _spod_proxy var.
 	script := fmt.Sprintf(
-		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
 cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
-_spod_proxy="%s"
-claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
-codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
+_spod_proxy="http://127.0.0.1:%s"
+_spod_claude_bin=$(which claude 2>/dev/null)
+_spod_codex_bin=$(which codex 2>/dev/null)
+claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_claude_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_codex_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
 %s
 SPOD_EOF`,
-		beginMarker, proxyURL, endMarker,
+		beginMarker, tunnelPort, endMarker,
 	)
 	if _, err := ssh(script); err != nil {
 		warn("代理配置写入失败（将在连接后重试）")
