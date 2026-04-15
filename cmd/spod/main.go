@@ -1025,27 +1025,30 @@ func cmdVpnWatch() {
 	}
 
 	// Background connectivity probe — tun0 check is cheap (no network traffic).
-	// TCP :22 check only once per 60s to avoid hammering SuperPod.
+	// TCP :22 probe uses exponential backoff in BOTH directions:
+	//   success: 30s → 60s → ... → 5min  (slow down when stable)
+	//   failure: 30s → 60s → ... → 5min  (avoid hammering overloaded login service)
+	// Resets to 30s only when tun0 transitions from down→up (fresh connection).
 	var isUp bool
 	var lastTCPCheck time.Time
 	var wasTunnelUp bool
-	var tcpInterval = 30 * time.Second // start fast, back off on success
+	var tcpInterval = 30 * time.Second
 	const tcpIntervalMax = 5 * time.Minute
 	go func() {
 		for {
 			tunnelUp := vpnTunnelUp()
 			up := false
 			justConnected := tunnelUp && !wasTunnelUp
+			if justConnected {
+				// Fresh VPN connection — reset to fast probe for quick feedback
+				tcpInterval = 30 * time.Second
+			}
 			if tunnelUp && (justConnected || time.Since(lastTCPCheck) >= tcpInterval) {
 				up = vpnIsUp()
 				lastTCPCheck = time.Now()
-				if up {
-					// Connected — slow down probes
-					tcpInterval = min(tcpInterval*2, tcpIntervalMax)
-				} else {
-					// Not reachable — keep at 30s to detect recovery promptly
-					tcpInterval = 30 * time.Second
-				}
+				// Exponential backoff regardless of result — both success and failure
+				// back off to reduce SSH connection pressure on SuperPod login nodes
+				tcpInterval = min(tcpInterval*2, tcpIntervalMax)
 			} else if tunnelUp {
 				mu.Lock()
 				up = isUp
@@ -1053,7 +1056,7 @@ func cmdVpnWatch() {
 			}
 			wasTunnelUp = tunnelUp
 			if !tunnelUp {
-				tcpInterval = 30 * time.Second // reset on disconnect
+				tcpInterval = 30 * time.Second
 			}
 			mu.Lock()
 			isUp = up
@@ -1695,6 +1698,62 @@ func cmdCreds() {
 	}
 }
 
+func cmdUptime() {
+	out, err := ssh("hostname; awk '{print int($1)}' /proc/uptime; uptime -s; uptime")
+	if err != nil {
+		fail(fmt.Sprintf("查询失败: %v", err))
+		os.Exit(1)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) < 4 {
+		fail("返回格式异常")
+		fmt.Fprintln(os.Stderr, out)
+		os.Exit(1)
+	}
+	hostName := strings.TrimSpace(lines[0])
+	upSec, _ := strconv.Atoi(strings.TrimSpace(lines[1]))
+	bootTime := strings.TrimSpace(lines[2])
+	fullLine := strings.TrimSpace(lines[3])
+
+	load, users := "", ""
+	if idx := strings.Index(fullLine, "load average:"); idx >= 0 {
+		load = strings.TrimSpace(fullLine[idx+len("load average:"):])
+	}
+	if idx := strings.Index(fullLine, " user"); idx >= 0 {
+		parts := strings.Fields(fullLine[:idx])
+		if len(parts) > 0 {
+			users = parts[len(parts)-1]
+		}
+	}
+
+	dur := time.Duration(upSec) * time.Second
+	var upStr string
+	switch {
+	case dur < time.Hour:
+		upStr = fmt.Sprintf("%d 分钟", int(dur.Minutes()))
+	case dur < 24*time.Hour:
+		upStr = fmt.Sprintf("%d 小时 %d 分钟", int(dur.Hours()), int(dur.Minutes())%60)
+	default:
+		upStr = fmt.Sprintf("%d 天 %d 小时", int(dur.Hours())/24, int(dur.Hours())%24)
+	}
+
+	info(fmt.Sprintf("节点: %s%s%s", bold, hostName, reset))
+	info(fmt.Sprintf("启动: %s  (运行 %s)", bootTime, upStr))
+	if load != "" {
+		info(fmt.Sprintf("负载: %s   用户: %s", load, users))
+	}
+
+	if dur < time.Hour {
+		warn("登录节点近期重启 —— 之前的 tmux 会话很可能已丢失")
+	} else if load != "" {
+		if parts := strings.Split(load, ","); len(parts) > 0 {
+			if l1, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64); err == nil && l1 > 20 {
+				warn(fmt.Sprintf("1 分钟负载 %.2f 偏高，SSH 可能不稳定", l1))
+			}
+		}
+	}
+}
+
 func cmdHelp() {
 	fmt.Fprintf(os.Stderr, "\n  %s%sspod%s %s— SuperPod 会话管理%s\n\n", bold, cPurple, reset, cGray, reset)
 	fmt.Fprintf(os.Stderr, "  %s用法%s\n", bold, reset)
@@ -1722,6 +1781,7 @@ func cmdHelp() {
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
 		{"spod creds", "同步本地凭证到 SuperPod"},
+		{"spod uptime", "查看 login 节点启动时间和负载"},
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
@@ -1822,6 +1882,8 @@ func main() {
 		cmdSpeedtest(dur)
 	case "creds":
 		cmdCreds()
+	case "uptime":
+		cmdUptime()
 	case "ssh":
 		ensureTunnel()
 		if err := sshInteractive(); err != nil {
