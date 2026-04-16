@@ -19,12 +19,15 @@ import (
 
 var (
 	host       = envOr("SPOD_SSH_HOST", "superpod")
-	tunnelPort = envOr("TUNNEL_PORT", "17897")
+	tunnelPort = os.Getenv("TUNNEL_PORT") // empty → computed from remote UID in ensurePorts()
 	localPort  = envOr("CLASH_PORT", "7897")
 	socksPort  = envOr("SOCKS_PORT", "1080")
-	relayPort  = "" // computed in ensureRelay(): tunnelPort + remoteUID%1000 + 1
+	relayPort  = os.Getenv("SPOD_RELAY_PORT") // empty → computed from remote UID in ensurePorts()
 	prefix     = "spod"
 	vpnScript  = "" // resolved in init()
+
+	remoteUID int // lazily fetched via ssh("id -u"), cached on disk
+	portsMu   sync.Mutex
 )
 
 func envOr(key, fallback string) string {
@@ -71,9 +74,10 @@ func init() {
 		}
 		// Re-read vars after loading .env
 		host = envOr("SPOD_SSH_HOST", "superpod")
-		tunnelPort = envOr("TUNNEL_PORT", "17897")
+		tunnelPort = os.Getenv("TUNNEL_PORT")
 		localPort = envOr("CLASH_PORT", "7897")
 		socksPort = envOr("SOCKS_PORT", "1080")
+		relayPort = os.Getenv("SPOD_RELAY_PORT")
 		break
 	}
 
@@ -300,21 +304,25 @@ func sshInteractive(args ...string) error {
 
 // ── Tunnel ──
 
-// tunnelPID finds the autossh process managing our tunnel.
-// Verifies via /proc/PID/cmdline to avoid pgrep self-matches and
-// child ssh process false positives.
-func tunnelPID() int {
-	cmd := exec.Command("pgrep", "-f", "autossh.*-R "+tunnelPort+":127.0.0.1:"+localPort)
+// tunnelPIDAndPort returns (pid, remote port) of the running autossh that
+// reverse-forwards our localPort, or (0, "") if none. Matches any remote
+// port — callers decide whether it's the expected one. Regex is anchored
+// to the exact -R forward targeting 127.0.0.1:<localPort> so an autossh
+// with multiple -R flags cannot yield a sibling forward's port.
+func tunnelPIDAndPort() (int, string) {
+	// Word boundary after the port prevents false match on a longer port
+	// that shares our port as prefix (e.g. 78970 vs 7897).
+	quotedLocal := regexp.QuoteMeta(localPort)
+	pgrepPattern := `autossh.*-R [0-9]+:127\.0\.0\.1:` + quotedLocal + `([^0-9]|$)`
+	procRE := regexp.MustCompile(`-R (\d+):127\.0\.0\.1:` + quotedLocal + `(?:[^0-9]|$)`)
+
+	cmd := exec.Command("pgrep", "-f", pgrepPattern)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
-		return 0
+		return 0, ""
 	}
-	out := strings.TrimSpace(stdout.String())
-	if out == "" {
-		return 0
-	}
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
 		pid, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil || pid <= 0 {
 			continue
@@ -323,11 +331,123 @@ func tunnelPID() int {
 		if err != nil {
 			continue // process already gone (pgrep self-match)
 		}
-		if strings.Contains(string(cmdline), "autossh") {
-			return pid
+		// /proc cmdline separates args with NUL; normalize for regex.
+		normalized := strings.ReplaceAll(string(cmdline), "\x00", " ")
+		if !strings.Contains(normalized, "autossh") {
+			continue
+		}
+		m := procRE.FindStringSubmatch(normalized)
+		if len(m) < 2 {
+			continue
+		}
+		return pid, m[1]
+	}
+	return 0, ""
+}
+
+func tunnelPID() int {
+	pid, _ := tunnelPIDAndPort()
+	return pid
+}
+
+// waitForExit polls up to maxWait for pid to exit. Returns true if gone.
+func waitForExit(pid int, maxWait time.Duration) bool {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// killTunnelPID sends SIGTERM, waits up to 5s, then SIGKILL if still alive.
+func killTunnelPID(pid int) {
+	syscall.Kill(pid, syscall.SIGTERM)
+	if !waitForExit(pid, 5*time.Second) {
+		syscall.Kill(pid, syscall.SIGKILL)
+		waitForExit(pid, 2*time.Second)
+	}
+}
+
+// uidCachePath returns a per-identity cache path keyed by SSH user@host.
+// Keying by identity prevents a stale cached UID after the user switches
+// SUPERPOD_USER or SUPERPOD_HOST to a different account.
+func uidCachePath() string {
+	cacheDir, _ := os.UserCacheDir()
+	if cacheDir == "" {
+		return ""
+	}
+	sshUser := envOr("SUPERPOD_USER", "")
+	sshHost := envOr("SUPERPOD_HOST", host)
+	key := sshHost
+	if sshUser != "" {
+		key = sshUser + "@" + sshHost
+	}
+	safe := regexp.MustCompile(`[^a-zA-Z0-9._@-]`).ReplaceAllString(key, "_")
+	return filepath.Join(cacheDir, "spod", "remote-uid-"+safe)
+}
+
+// getRemoteUID fetches the SuperPod UID via `ssh id -u`, caching the result
+// in memory and on disk to avoid repeated SSH.
+func getRemoteUID() int {
+	portsMu.Lock()
+	defer portsMu.Unlock()
+	if remoteUID > 0 {
+		return remoteUID
+	}
+	cachePath := uidCachePath()
+	if cachePath != "" {
+		if data, err := os.ReadFile(cachePath); err == nil {
+			if uid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && uid > 0 {
+				remoteUID = uid
+				return uid
+			}
 		}
 	}
-	return 0
+	out, err := ssh("id -u")
+	if err != nil {
+		return 0
+	}
+	uid, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || uid <= 0 {
+		return 0
+	}
+	remoteUID = uid
+	if cachePath != "" {
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.Itoa(uid)), 0600)
+	}
+	return uid
+}
+
+// ensurePorts computes per-user tunnelPort / relayPort from the remote UID.
+// Env vars TUNNEL_PORT and SPOD_RELAY_PORT take precedence if set.
+// Uses separate bases (17000 / 18000) so tunnel and relay ports can never
+// collide across users even if their UIDs share the same %1000 bucket.
+func ensurePorts() {
+	if tunnelPort != "" && relayPort != "" {
+		return
+	}
+	uid := getRemoteUID()
+	if uid == 0 {
+		// UID lookup failed (SSH down); fall back to legacy shared defaults
+		// so single-user setups still work.
+		if tunnelPort == "" {
+			tunnelPort = "17897"
+		}
+		if relayPort == "" {
+			relayPort = "18897"
+		}
+		return
+	}
+	if tunnelPort == "" {
+		tunnelPort = strconv.Itoa(17000 + uid%1000)
+	}
+	if relayPort == "" {
+		relayPort = strconv.Itoa(18000 + uid%1000)
+	}
 }
 
 func ensureVPN() {
@@ -354,16 +474,44 @@ func ensureTunnel() {
 		}()
 	}
 
-	pid := tunnelPID()
+	ensurePorts()
+
+	// Clean up any stale autossh whose -R port doesn't match our expected
+	// tunnelPort. Loops so that multiple stale instances are all reaped,
+	// and re-scans after each kill to confirm the PID is gone before
+	// starting a new autossh (ExitOnForwardFailure=yes is unforgiving if
+	// the old ssh child still holds the remote bind).
+	killed := 0
+	for {
+		pid, runningPort := tunnelPIDAndPort()
+		if pid == 0 || runningPort == tunnelPort {
+			break
+		}
+		warn(fmt.Sprintf("旧隧道端口 %s ≠ 预期 %s，清理 pid=%d", runningPort, tunnelPort, pid))
+		killTunnelPID(pid)
+		killed++
+		if killed >= 5 {
+			warn("清理旧隧道超过 5 次，放弃")
+			break
+		}
+	}
+	if killed > 0 {
+		// Give remote sshd a moment to release the -R port binding before
+		// the new autossh tries to rebind.
+		time.Sleep(2 * time.Second)
+	}
+
+	pid, _ := tunnelPIDAndPort()
 	if pid > 0 {
-		// PID exists — verify the underlying SSH connection is still alive
+		// PID exists and matches expected port — verify the underlying
+		// SSH connection is still alive
 		probe := exec.Command("ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", host, "true")
 		if err := probe.Run(); err != nil {
 			warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
-			syscall.Kill(pid, syscall.SIGTERM)
-			time.Sleep(1 * time.Second)
+			killTunnelPID(pid)
+			time.Sleep(2 * time.Second)
 		} else {
-			ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
+			ok(fmt.Sprintf("隧道运行中 (pid=%d, port=%s)", pid, tunnelPort))
 			return
 		}
 	}
@@ -1365,14 +1513,20 @@ func printSessions(sessions []session) {
 	fmt.Fprintln(os.Stderr)
 }
 
-func ensureTmuxConf() {
-	// Combined with ensureRemoteProxy into one SSH call when possible.
-	// Kept as standalone for backwards compat.
-	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
-}
-
-func ensureTmuxConfAndProxy() {
+// ensureTmuxConfAndProxy writes the claude/codex proxy wrappers into ~/.bashrc.
+// If useRelay is true, the wrappers point to relayPort (spod-relay.py absorbs
+// short tunnel outages). If false — because ensureRelay() failed — they point
+// directly to tunnelPort so claude/codex still work, just without retry.
+func ensureTmuxConfAndProxy(useRelay bool) {
 	// Combine tmux conf + proxy config into a single SSH call to reduce connections.
+	proxyPort := tunnelPort
+	if useRelay && relayPort != "" {
+		proxyPort = relayPort
+	}
+	if proxyPort == "" {
+		warn("代理端口未就绪，跳过 bashrc 写入")
+		return
+	}
 	beginMarker := "# spod-proxy-begin"
 	endMarker := "# spod-proxy-end"
 	script := fmt.Sprintf(
@@ -1389,7 +1543,7 @@ claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROX
 codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_codex_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
 %s
 SPOD_EOF`,
-		beginMarker, tunnelPort, endMarker,
+		beginMarker, proxyPort, endMarker,
 	)
 	if _, err := ssh(script); err != nil {
 		warn("远程配置写入失败（将在连接后重试）")
@@ -1399,9 +1553,9 @@ SPOD_EOF`,
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
 // It sits between claude/codex and the SSH tunnel, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
-// relayScript listens on a per-user TCP port (tunnelPort + UID % 1000) to
-// avoid collisions on shared login nodes. Falls back to retrying upstream
-// when the SSH tunnel is temporarily down.
+// Both this relay and the upstream SSH tunnel bind per-user ports derived
+// from the remote UID (18000+uid%1000 and 17000+uid%1000 respectively) to
+// avoid collisions on shared login nodes.
 const relayScript = `#!/usr/bin/env python3
 import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
@@ -1444,17 +1598,15 @@ while True:
     threading.Thread(target=handle,args=(c,),daemon=True).start()
 `
 
-func ensureRelay() {
-	// Compute per-user relay port from remote UID to avoid collisions on shared nodes.
-	if relayPort == "" {
-		uidStr, err := ssh("id -u")
-		if err != nil {
-			warn("无法获取远程 UID，跳过 relay")
-			return
-		}
-		uid, _ := strconv.Atoi(strings.TrimSpace(uidStr))
-		tp, _ := strconv.Atoi(tunnelPort)
-		relayPort = strconv.Itoa(tp + (uid%1000) + 1)
+// ensureRelay deploys and starts spod-relay.py on SuperPod. Returns true iff
+// the relay is confirmed running on relayPort — caller uses this to decide
+// whether the claude/codex proxy should point at the relay or fall back to
+// the tunnel directly.
+func ensureRelay() bool {
+	ensurePorts()
+	if relayPort == "" || tunnelPort == "" {
+		warn("端口未就绪，跳过 relay")
+		return false
 	}
 
 	// Deploy and start the TCP relay on SuperPod.
@@ -1488,49 +1640,28 @@ fi`,
 	out, err := ssh(script)
 	if err != nil {
 		warn(fmt.Sprintf("Relay 部署失败: %v", err))
-		return
+		return false
 	}
 	switch strings.TrimSpace(out) {
 	case "running":
-		// silent — already running
+		return true
 	case "started":
 		ok(fmt.Sprintf("Relay 已启动 (:%s → :%s，隧道断开时自动等待重连)", relayPort, tunnelPort))
+		return true
 	case "failed":
-		warn("Relay 启动失败，查看日志: /tmp/spod-relay.log")
-	}
-}
-
-func ensureRemoteProxy() {
-	// Set up shell wrapper functions for claude/codex so ONLY their processes
-	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
-	// Points directly to the SSH tunnel (not relay — relay adds latency/hangs under concurrent load).
-	beginMarker := "# spod-proxy-begin"
-	endMarker := "# spod-proxy-end"
-
-	script := fmt.Sprintf(
-		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
-cat >> ~/.bashrc << 'SPOD_EOF'
-
-%s
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
-_spod_proxy="http://127.0.0.1:%s"
-_spod_claude_bin=$(which claude 2>/dev/null)
-_spod_codex_bin=$(which codex 2>/dev/null)
-claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_claude_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
-codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_codex_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
-%s
-SPOD_EOF`,
-		beginMarker, tunnelPort, endMarker,
-	)
-	if _, err := ssh(script); err != nil {
-		warn("代理配置写入失败（将在连接后重试）")
+		warn("Relay 启动失败，查看日志: /tmp/spod-relay-$(id -u).log")
+		return false
+	default:
+		warn(fmt.Sprintf("Relay 状态未知: %q", strings.TrimSpace(out)))
+		return false
 	}
 }
 
 func ensureRemoteSetup() {
-	// Relay first (computes per-user relay port), then proxy (uses that port)
-	ensureRelay()
-	ensureTmuxConfAndProxy()
+	// Relay first (computes per-user ports); proxy config rides the relay
+	// if it came up, otherwise points direct to the tunnel.
+	relayOK := ensureRelay()
+	ensureTmuxConfAndProxy(relayOK)
 }
 
 func attachOrCreate(name string) {

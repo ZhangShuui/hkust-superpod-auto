@@ -50,10 +50,10 @@ One-command toolkit for connecting to HKUST SuperPod HPC from WSL2 and running C
 ```
 Local WSL2
   ├─ spod vpn → hkust-vpn.py → openconnect + vpn-slice → HKUST network
-  ├─ Clash (:7890) ◄── autossh reverse tunnel ◄── SuperPod (:17897)
+  ├─ Clash (:7890) ◄── autossh reverse tunnel ◄── SuperPod (:per-user tunnel)
   ├─ spod socks → autossh -D 0.0.0.0:1080 → SOCKS5 代理 → Windows 可用
-  └─ spod → SSH + tmux → SuperPod → Claude Code (→ :17897 → Clash → Anthropic API)
-                                    → Codex     (→ :17897 → Clash → OpenAI API)
+  └─ spod → SSH + tmux → SuperPod → Claude Code (→ :relay → :tunnel → Clash → Anthropic API)
+                                    → Codex     (→ :relay → :tunnel → Clash → OpenAI API)
 
 Windows ──► SOCKS5 (127.0.0.1:1080) ──► WSL VPN ──► SuperPod 内网
   ├─ SSH (connect.exe -S)

@@ -92,7 +92,7 @@ spod                  # 重连，tmux 保住了进程
     │
     ├─ spod vpn ─── hkust-vpn.py ─── openconnect + vpn-slice ─── HKUST 内网
     │                                                                  │
-    ├─ Clash (:7890) ◄──── autossh 反向隧道 ◄──────────── SuperPod (:17897)
+    ├─ Clash (:7890) ◄──── autossh 反向隧道 ◄──────────── SuperPod (:per-user)
     │                                                          │
     ├─ spod socks ─── autossh -D 0.0.0.0:1080 ─── SOCKS5 代理
     │                       ▲                           │
@@ -102,7 +102,7 @@ spod                  # 重连，tmux 保住了进程
     └─ spod ─── SSH + tmux ──────────────────────────── SuperPod
                                                                │
                                                          Claude Code / Codex
-                                                    (API → :17897 → 隧道 → Clash → Anthropic / OpenAI)
+                                                    (API → relay → 隧道 → Clash → Anthropic / OpenAI)
 ```
 
 ## 核心能力
@@ -205,7 +205,8 @@ scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
 | `SUPERPOD_USER` | SSH 用户名 | sync.sh |
 | `SUPERPOD_HOST` | 主机名 | VPN 脚本 |
 | `CLASH_PORT` | 本地 Clash 端口 | spod + VPN |
-| `TUNNEL_PORT` | 反向隧道端口 | spod |
+| `TUNNEL_PORT` | 反向隧道端口（默认按 UID 自动分配） | spod |
+| `SPOD_RELAY_PORT` | Relay 端口（默认按 UID 自动分配） | spod |
 | `SOCKS_PORT` | SOCKS5 代理端口（默认 1080） | spod socks |
 | `SPOD_SSH_HOST` | SSH Host 别名 | spod |
 | `VPN_SCRIPT` | VPN 脚本路径 | spod |
