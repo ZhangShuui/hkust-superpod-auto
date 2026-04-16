@@ -1514,13 +1514,13 @@ func printSessions(sessions []session) {
 }
 
 // ensureTmuxConfAndProxy writes the claude/codex proxy wrappers into ~/.bashrc.
-// If useRelay is true, the wrappers point to relayPort (spod-relay.py absorbs
-// short tunnel outages). If false — because ensureRelay() failed — they point
-// directly to tunnelPort so claude/codex still work, just without retry.
+// By default points direct at tunnelPort — the Python relay introduces a
+// userspace hop that causes intermittent UND_ERR_SOCKET errors in undici
+// (Claude Code's HTTP client) for large/streaming requests. Set
+// SPOD_USE_RELAY=1 to opt in (adds tunnel-down retry at cost of stability).
 func ensureTmuxConfAndProxy(useRelay bool) {
-	// Combine tmux conf + proxy config into a single SSH call to reduce connections.
 	proxyPort := tunnelPort
-	if useRelay && relayPort != "" {
+	if useRelay && relayPort != "" && os.Getenv("SPOD_USE_RELAY") == "1" {
 		proxyPort = relayPort
 	}
 	if proxyPort == "" {
