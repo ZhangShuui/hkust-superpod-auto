@@ -1557,23 +1557,30 @@ SPOD_EOF`,
 // from the remote UID (18000+uid%1000 and 17000+uid%1000 respectively) to
 // avoid collisions on shared login nodes.
 const relayScript = `#!/usr/bin/env python3
+# Bidirectional TCP relay with proper half-close handling. When one side
+# sends FIN (recv returns 0), we forward that as shutdown(SHUT_WR) on the
+# other socket instead of closing — the peer may still have buffered data
+# to send in the other direction (typical for HTTP/1.1 keepalive, SSE
+# streaming, TLS close_notify). Closing both sockets on first EOF was
+# truncating streaming API responses mid-flight.
 import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
 RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
-def relay(s,d):
+def pipe(src,dst):
     try:
         while True:
-            b=s.recv(65536)
-            if not b:break
-            d.sendall(b)
-    except:pass
-    finally:
-        try:s.close()
-        except:pass
-        try:d.close()
+            b=src.recv(65536)
+            if not b:
+                try:dst.shutdown(socket.SHUT_WR)
+                except:pass
+                return
+            dst.sendall(b)
+    except:
+        try:dst.shutdown(socket.SHUT_WR)
         except:pass
 def handle(c):
+    c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
     end=time.time()+RETRY_SEC;n=0;delay=3
     while time.time()<end:
         try:
@@ -1584,9 +1591,14 @@ def handle(c):
         if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
         c.close();return
     if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
-    a=threading.Thread(target=relay,args=(c,u),daemon=True)
-    b=threading.Thread(target=relay,args=(u,c),daemon=True)
+    u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+    a=threading.Thread(target=pipe,args=(c,u),daemon=True)
+    b=threading.Thread(target=pipe,args=(u,c),daemon=True)
     a.start();b.start();a.join();b.join()
+    try:c.close()
+    except:pass
+    try:u.close()
+    except:pass
 signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
