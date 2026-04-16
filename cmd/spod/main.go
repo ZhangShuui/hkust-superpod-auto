@@ -1514,13 +1514,13 @@ func printSessions(sessions []session) {
 }
 
 // ensureTmuxConfAndProxy writes the claude/codex proxy wrappers into ~/.bashrc.
-// By default points direct at tunnelPort — the Python relay introduces a
-// userspace hop that causes intermittent UND_ERR_SOCKET errors in undici
-// (Claude Code's HTTP client) for large/streaming requests. Set
-// SPOD_USE_RELAY=1 to opt in (adds tunnel-down retry at cost of stability).
+// Routes through relayPort when ensureRelay() confirmed the relay is up,
+// so short tunnel outages are absorbed via 900s upstream retry. Falls
+// back to direct tunnelPort if relay setup failed. Set SPOD_NO_RELAY=1
+// to force bypass (emergency override).
 func ensureTmuxConfAndProxy(useRelay bool) {
 	proxyPort := tunnelPort
-	if useRelay && relayPort != "" && os.Getenv("SPOD_USE_RELAY") == "1" {
+	if useRelay && relayPort != "" && os.Getenv("SPOD_NO_RELAY") != "1" {
 		proxyPort = relayPort
 	}
 	if proxyPort == "" {
@@ -1557,12 +1557,12 @@ SPOD_EOF`,
 // from the remote UID (18000+uid%1000 and 17000+uid%1000 respectively) to
 // avoid collisions on shared login nodes.
 const relayScript = `#!/usr/bin/env python3
-# Bidirectional TCP relay with proper half-close handling. When one side
-# sends FIN (recv returns 0), we forward that as shutdown(SHUT_WR) on the
-# other socket instead of closing — the peer may still have buffered data
-# to send in the other direction (typical for HTTP/1.1 keepalive, SSE
-# streaming, TLS close_notify). Closing both sockets on first EOF was
-# truncating streaming API responses mid-flight.
+# TCP relay with half-close handling + explicit settimeout(None) after
+# connect. socket.create_connection(timeout=N) leaks N as the socket's
+# DEFAULT timeout, so every subsequent recv/send raises TimeoutError
+# after N seconds of idle — that was spuriously shutting down idle
+# keepalive connections 3s after CONNECT and causing UND_ERR_SOCKET
+# in Claude Code (undici pools and reuses idle HTTPS CONNECT tunnels).
 import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
@@ -1580,6 +1580,7 @@ def pipe(src,dst):
         try:dst.shutdown(socket.SHUT_WR)
         except:pass
 def handle(c):
+    c.settimeout(None)
     c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
     end=time.time()+RETRY_SEC;n=0;delay=3
     while time.time()<end:
@@ -1591,6 +1592,7 @@ def handle(c):
         if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
         c.close();return
     if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
+    u.settimeout(None)  # critical: clear the 3s timeout leaked by create_connection
     u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
     a=threading.Thread(target=pipe,args=(c,u),daemon=True)
     b=threading.Thread(target=pipe,args=(u,c),daemon=True)
