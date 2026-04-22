@@ -526,6 +526,20 @@ def _apply_dns_entry(host, ip, sudo_password):
     )
 
 
+def _wait_tun0_ready(timeout=30):
+    """Block until tun0 interface exists and is UP, so `ip route ... dev tun0` won't silently fail."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open("/sys/class/net/tun0/operstate") as f:
+                if f.read().strip() in ("up", "unknown"):  # point-to-point shows "unknown"
+                    return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=15):
     """Resolve hosts via VPN DNS and add /etc/hosts entries + routes.
 
@@ -535,6 +549,12 @@ def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=15):
     Uses a local cache file (.dns-cache.json) to skip DNS queries for
     hosts with known stable IPs (e.g. university HPC clusters).
     """
+    # Wait for openconnect to bring tun0 up — otherwise `ip route ... dev tun0`
+    # silently fails and split-tunnel traffic falls back to the default route.
+    if not _wait_tun0_ready():
+        log.warning("[!] DNS fix: tun0 did not come up within 30s")
+        return False
+
     cache = _load_dns_cache()
     resolved = set()
 
