@@ -48,7 +48,7 @@ cd hkust-superpod-auto
 # 2. 安装依赖
 sudo apt install openconnect autossh golang-go
 pip install pyotp playwright vpn-slice
-playwright install chromium
+playwright install firefox
 
 # 3. 编译安装 spod
 cd cmd/spod && go build -o spod . && cp spod ~/.local/bin/ && cd ../..

@@ -17,7 +17,7 @@ export PATH=$PATH:/usr/local/go/bin
 test -x .venv/bin/vpn-slice || (python3 -m venv .venv && .venv/bin/pip install vpn-slice pyotp playwright)
 
 # 4. Playwright browsers
-ls ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome >/dev/null 2>&1 || python3 -m playwright install chromium
+ls ~/.cache/ms-playwright/firefox-*/firefox/firefox >/dev/null 2>&1 || python3 -m playwright install firefox
 
 # 5. Build and install spod CLI
 which spod || (cd cmd/spod && go build -o ~/.local/bin/spod . && cd ../..)
