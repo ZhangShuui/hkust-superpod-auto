@@ -1537,10 +1537,8 @@ cat >> ~/.bashrc << 'SPOD_EOF'
 %s
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
 _spod_proxy="http://127.0.0.1:%s"
-_spod_claude_bin=$(which claude 2>/dev/null)
-_spod_codex_bin=$(which codex 2>/dev/null)
-claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_claude_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
-codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; "$_spod_codex_bin" "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command codex "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
 %s
 SPOD_EOF`,
 		beginMarker, proxyPort, endMarker,
@@ -1676,6 +1674,75 @@ func ensureRemoteSetup() {
 	// if it came up, otherwise points direct to the tunnel.
 	relayOK := ensureRelay()
 	ensureTmuxConfAndProxy(relayOK)
+	ensureRemoteCLIs()
+}
+
+// ensureRemoteCLIs verifies the claude/codex npm packages on SuperPod still
+// exist (symlink targets are present and executable). Observed 2026-04-29:
+// the @anthropic-ai/claude-code package directory was wiped clean (likely a
+// stale npm install state or a home-quota cleanup), leaving a dangling
+// symlink and `claude: command not found` from inside the wrapper. This
+// silently re-installs broken packages so the user doesn't have to debug.
+// Skip with SPOD_NO_CLI_CHECK=1.
+func ensureRemoteCLIs() {
+	if os.Getenv("SPOD_NO_CLI_CHECK") == "1" {
+		return
+	}
+	probe := `ENV_BIN="$HOME/.conda/envs/claude/bin"
+broken=""
+for name in claude codex; do
+    link="$ENV_BIN/$name"
+    [ -L "$link" ] || [ -e "$link" ] || { broken="$broken $name"; continue; }
+    target=$(readlink -f "$link" 2>/dev/null)
+    if [ -z "$target" ] || [ ! -x "$target" ]; then
+        broken="$broken $name"
+    fi
+done
+echo "BROKEN:${broken# }"
+[ -x "$ENV_BIN/npm" ] && echo "NPM:$ENV_BIN/npm" || echo "NPM:"
+`
+	out, err := ssh(probe)
+	if err != nil {
+		warn("远端 claude/codex 健康检查失败（跳过）")
+		return
+	}
+	var brokenLine, npmPath string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "BROKEN:"):
+			brokenLine = strings.TrimSpace(strings.TrimPrefix(line, "BROKEN:"))
+		case strings.HasPrefix(line, "NPM:"):
+			npmPath = strings.TrimSpace(strings.TrimPrefix(line, "NPM:"))
+		}
+	}
+	if brokenLine == "" {
+		return
+	}
+	if npmPath == "" {
+		warn(fmt.Sprintf("远端 %s 损坏（symlink 目标缺失），但 conda env 'claude' 里没找到 npm，无法自动修复", brokenLine))
+		warn("手动修复: ssh superpod 后激活 claude env，运行 npm install -g @anthropic-ai/claude-code @openai/codex")
+		return
+	}
+	pkgs := []string{}
+	for _, name := range strings.Fields(brokenLine) {
+		switch name {
+		case "claude":
+			pkgs = append(pkgs, "@anthropic-ai/claude-code")
+		case "codex":
+			pkgs = append(pkgs, "@openai/codex")
+		}
+	}
+	if len(pkgs) == 0 {
+		return
+	}
+	warn(fmt.Sprintf("远端 %s 损坏，正在重新安装 %s ...", brokenLine, strings.Join(pkgs, " ")))
+	fixCmd := fmt.Sprintf("%s install -g %s 2>&1 | tail -3", npmPath, strings.Join(pkgs, " "))
+	fixOut, fixErr := ssh(fixCmd)
+	if fixErr != nil {
+		warn(fmt.Sprintf("重装失败: %v\n%s", fixErr, strings.TrimSpace(fixOut)))
+		return
+	}
+	info(fmt.Sprintf("重装完成: %s", strings.TrimSpace(fixOut)))
 }
 
 func attachOrCreate(name string) {
