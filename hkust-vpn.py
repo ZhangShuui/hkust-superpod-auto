@@ -153,10 +153,18 @@ def _dump_page_debug(page, label):
     Timestamp format YYYYMMDD-HHMMSS sorts lexicographically by time.
     """
     debug_dir = Path(__file__).resolve().parent
-    existing = sorted(debug_dir.glob(f"{label}-*.png"))
-    for old_png in existing[:-4]:  # keep newest 4, the new dump becomes the 5th
-        for ext in (".png", ".html", ".txt"):
-            old_png.with_suffix(ext).unlink(missing_ok=True)
+    # Scan all three extensions, not just .png — screenshot can fail (page closed,
+    # browser crashed) while the html/text writes still succeed, leaving orphan
+    # .html/.txt with no matching .png. A glob over .png alone misses them and
+    # they accumulate forever.
+    stems = sorted({
+        p.stem
+        for ext in ("png", "html", "txt")
+        for p in debug_dir.glob(f"{label}-*.{ext}")
+    })
+    for old_stem in stems[:-4]:  # keep newest 4, the new dump becomes the 5th
+        for ext in ("png", "html", "txt"):
+            (debug_dir / f"{old_stem}.{ext}").unlink(missing_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     try:
         png = debug_dir / f"{label}-{ts}.png"

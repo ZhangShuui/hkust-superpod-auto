@@ -519,7 +519,10 @@ func ensureTunnel() {
 	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
 
 	logPath := filepath.Join(os.TempDir(), "spod-tunnel.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	// Truncate on each new autossh start: the prior autossh (if any) was
+	// already killed in the loop above, and append-mode would otherwise
+	// grow without bound across reconnect storms.
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		warn(fmt.Sprintf("无法打开日志文件: %v", err))
 	}
@@ -638,7 +641,8 @@ func ensureSocks() {
 	info(fmt.Sprintf("启动 SOCKS5 代理 (0.0.0.0:%s → SuperPod)...", socksPort))
 
 	logPath := filepath.Join(os.TempDir(), "spod-socks.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	// Truncate on each new autossh start (mirrors ensureTunnel rationale).
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		warn(fmt.Sprintf("无法打开日志文件: %v", err))
 	}
@@ -1030,6 +1034,25 @@ func cmdVpnStop() {
 			break
 		}
 		time.Sleep(300 * time.Millisecond)
+	}
+	// SIGTERM may be ignored or stuck in cleanup; escalate to SIGKILL so a
+	// later cmdVpnRestart can't double-launch a second VPN against a still-
+	// alive openconnect that's holding tun0.
+	if err := syscall.Kill(pid, 0); err == nil {
+		warn(fmt.Sprintf("SIGTERM 后 pid=%d 仍存活，发送 SIGKILL", pid))
+		syscall.Kill(-pid, syscall.SIGKILL)
+		syscall.Kill(pid, syscall.SIGKILL)
+		killDeadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(killDeadline) {
+			if err := syscall.Kill(pid, 0); err != nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if err := syscall.Kill(pid, 0); err == nil {
+			fail(fmt.Sprintf("pid=%d 抗 SIGKILL（D 状态？），保留 PID 文件以防重启冲突", pid))
+			return
+		}
 	}
 	os.Remove(vpnPIDFile)
 	ok(fmt.Sprintf("VPN 已停止 (pid=%d)", pid))
@@ -1565,6 +1588,11 @@ import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
 RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
+# Cap concurrent handlers. During a long tunnel outage, every retry from
+# claude/codex would otherwise spawn a fresh handler that sits in the 900s
+# reconnect loop, accumulating threads + sockets without bound. Drop the
+# overflow immediately so the client sees a fast reset and retries later.
+MAX_INFLIGHT=50; SEM=threading.Semaphore(MAX_INFLIGHT)
 def pipe(src,dst):
     try:
         while True:
@@ -1578,27 +1606,35 @@ def pipe(src,dst):
         try:dst.shutdown(socket.SHUT_WR)
         except:pass
 def handle(c):
-    c.settimeout(None)
-    c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-    end=time.time()+RETRY_SEC;n=0;delay=3
-    while time.time()<end:
-        try:
-            u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3);break
-        except:
-            n+=1;time.sleep(delay);delay=min(delay*2,30)
-    else:
-        if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
-        c.close();return
-    if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
-    u.settimeout(None)  # critical: clear the 3s timeout leaked by create_connection
-    u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-    a=threading.Thread(target=pipe,args=(c,u),daemon=True)
-    b=threading.Thread(target=pipe,args=(u,c),daemon=True)
-    a.start();b.start();a.join();b.join()
-    try:c.close()
-    except:pass
-    try:u.close()
-    except:pass
+    if not SEM.acquire(blocking=False):
+        if LOG:print(f"[relay] backpressure: dropped (>={MAX_INFLIGHT} inflight)",flush=True)
+        try:c.close()
+        except:pass
+        return
+    try:
+        c.settimeout(None)
+        c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+        end=time.time()+RETRY_SEC;n=0;delay=3
+        while time.time()<end:
+            try:
+                u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3);break
+            except:
+                n+=1;time.sleep(delay);delay=min(delay*2,30)
+        else:
+            if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
+            c.close();return
+        if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
+        u.settimeout(None)  # critical: clear the 3s timeout leaked by create_connection
+        u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+        a=threading.Thread(target=pipe,args=(c,u),daemon=True)
+        b=threading.Thread(target=pipe,args=(u,c),daemon=True)
+        a.start();b.start();a.join();b.join()
+        try:c.close()
+        except:pass
+        try:u.close()
+        except:pass
+    finally:
+        SEM.release()
 signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
