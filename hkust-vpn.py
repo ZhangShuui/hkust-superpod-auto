@@ -146,8 +146,17 @@ def setup_credentials(user):
 # ─── Browser Login Automation ─────────────────────────────────────────
 
 def _dump_page_debug(page, label):
-    """Save screenshot + HTML + visible text for post-mortem. Safe to call on any page state."""
+    """Save screenshot + HTML + visible text for post-mortem. Safe to call on any page state.
+
+    Keeps only the 5 most recent triplets per label so a long-running
+    auto-reconnect loop with repeated MFA failures can't fill the disk.
+    Timestamp format YYYYMMDD-HHMMSS sorts lexicographically by time.
+    """
     debug_dir = Path(__file__).resolve().parent
+    existing = sorted(debug_dir.glob(f"{label}-*.png"))
+    for old_png in existing[:-4]:  # keep newest 4, the new dump becomes the 5th
+        for ext in (".png", ".html", ".txt"):
+            old_png.with_suffix(ext).unlink(missing_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     try:
         png = debug_dir / f"{label}-{ts}.png"
@@ -698,14 +707,6 @@ def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
         )
         dns_thread.start()
 
-        # Health check in background
-        health_thread = threading.Thread(
-            target=_health_check,
-            args=(hosts,),
-            daemon=True,
-        )
-        health_thread.start()
-
         # Read and log openconnect output
         for line in proc.stdout:
             text = line.decode("utf-8", errors="replace").rstrip()
@@ -728,6 +729,16 @@ def auto_reconnect(user, password, totp_secret, sudo_password,
       - Inactivity timeout: 30 min
       - Max session length: 240 min (4 hours)
     """
+    # Health check runs once for the lifetime of the process; previously it
+    # was restarted inside connect_vpn() on every reconnect, leaking one
+    # daemon thread per 4-hour session and accumulating concurrent SSH
+    # probes against the SuperPod login service.
+    threading.Thread(
+        target=_health_check,
+        args=(hosts or DEFAULT_HOSTS,),
+        daemon=True,
+    ).start()
+
     attempt = 0
     consecutive_login_failures = 0
 

@@ -17,6 +17,8 @@ speedtest.sh
 # Debug / temp
 mfa-debug.*
 superpod-*.txt
+step*-*.html
+step*-*.txt
 
 # Claude Code
 .claude/

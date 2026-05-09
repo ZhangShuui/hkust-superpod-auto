@@ -1736,7 +1736,11 @@ echo "BROKEN:${broken# }"
 		return
 	}
 	warn(fmt.Sprintf("远端 %s 损坏，正在重新安装 %s ...", brokenLine, strings.Join(pkgs, " ")))
-	fixCmd := fmt.Sprintf("%s install -g %s 2>&1 | tail -3", npmPath, strings.Join(pkgs, " "))
+	// PATH must include npm's directory so npm's "#!/usr/bin/env node"
+	// shebang resolves the node binary that lives next to it. SSH
+	// non-interactive sessions don't source ~/.bashrc, so without this
+	// the install fails with "/usr/bin/env: 'node': No such file or directory".
+	fixCmd := fmt.Sprintf(`PATH="%s:$PATH" %s install -g %s 2>&1 | tail -3`, filepath.Dir(npmPath), npmPath, strings.Join(pkgs, " "))
 	fixOut, fixErr := ssh(fixCmd)
 	if fixErr != nil {
 		warn(fmt.Sprintf("重装失败: %v\n%s", fixErr, strings.TrimSpace(fixOut)))
