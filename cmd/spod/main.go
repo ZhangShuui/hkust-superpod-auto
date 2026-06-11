@@ -122,10 +122,18 @@ func ensureSSHConfig() {
 	sshDir := filepath.Join(home, ".ssh")
 	configPath := filepath.Join(sshDir, "config")
 
+	// Optional: route SSH to SuperPod through another machine's shared VPN via
+	// its SOCKS5 proxy (a rider borrowing the provider's `spod socks`). Pair
+	// with SUPERPOD_HOST=<SuperPod internal IP> to dodge hairpin NAT on the VIP.
+	proxyLine := ""
+	if p := envOr("SUPERPOD_SSH_PROXY", ""); p != "" {
+		proxyLine = fmt.Sprintf("\n    ProxyCommand nc -X 5 -x %s %%h %%p", p)
+	}
+
 	// Desired config block
 	desired := fmt.Sprintf(`Host superpod
     HostName %s
-    User %s
+    User %s%s
 
     # 连接复用：避免多次 SSH 握手触发服务端限流
     ControlMaster auto
@@ -135,7 +143,7 @@ func ensureSSHConfig() {
     # 心跳：每 15s 发一次，连续 4 次无响应才断（容忍 60s 网络抖动）
     ServerAliveInterval 15
     ServerAliveCountMax 4
-    TCPKeepAlive yes`, sshHost, sshUser)
+    TCPKeepAlive yes`, sshHost, sshUser, proxyLine)
 
 	// Read existing config
 	existing, _ := os.ReadFile(configPath)
@@ -143,9 +151,10 @@ func ensureSSHConfig() {
 
 	// Check if superpod block exists and is up to date
 	if strings.Contains(content, "Host superpod") {
-		// Check if config already matches desired
-		if strings.Contains(content, "ControlMaster auto") &&
-			strings.Contains(content, "User "+sshUser) {
+		// Exact-match idempotency: a loose check (just ControlMaster+User) would
+		// wrongly treat a stale block as correct and never add/update the
+		// ProxyCommand when SUPERPOD_SSH_PROXY changes.
+		if strings.Contains(content, desired) {
 			return // already correct
 		}
 		// Config outdated — replace the whole superpod block
@@ -451,11 +460,19 @@ func ensurePorts() {
 }
 
 func ensureVPN() {
+	// A rider borrowing another machine's VPN (via SUPERPOD_SSH_PROXY → that
+	// machine's `spod socks`) has no local tun0. SPOD_NO_VPN=1 skips the check
+	// so such a machine can still run spod (it reaches SuperPod through the
+	// provider's shared VPN, and adopts the provider's tunnel/relay).
+	if os.Getenv("SPOD_NO_VPN") == "1" {
+		return
+	}
 	if vpnTunnelUp() {
 		return
 	}
 	fail("VPN 未连接 — tun0 不存在")
 	info("运行 `spod vpn` 启动 VPN")
+	info("（借用他人 VPN 时用 SPOD_NO_VPN=1 跳过此检查）")
 	os.Exit(1)
 }
 
@@ -516,6 +533,20 @@ func ensureTunnel() {
 		}
 	}
 
+	// Shared-account tunnel adoption: another machine logged into the SAME
+	// SuperPod account already provides this reverse tunnel. The per-user
+	// tunnelPort is identical across machines on one account, and the remote
+	// :tunnelPort lives on the shared login-node loopback — so our claude/codex
+	// (and the shared relay) can ride it. Starting our own autossh here would
+	// only collide on the remote bind (ExitOnForwardFailure), thrash, and risk
+	// hijacking the port mid-flap onto a worse exit. If the remote port is
+	// already up and reachable as a proxy, adopt it instead of racing.
+	// SPOD_FORCE_TUNNEL=1 skips adoption (designated provider override).
+	if os.Getenv("SPOD_FORCE_TUNNEL") != "1" && remoteTunnelHealthy() {
+		ok(fmt.Sprintf("复用隧道 (SuperPod:%s 已由同账号另一台机器提供，本机不自建)", tunnelPort))
+		return
+	}
+
 	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
 
 	logPath := filepath.Join(os.TempDir(), "spod-tunnel.log")
@@ -565,6 +596,29 @@ func ensureTunnel() {
 	fail("隧道启动超时")
 	fail(fmt.Sprintf("日志: %s", logPath))
 	os.Exit(1)
+}
+
+// remoteTunnelHealthy reports whether the remote reverse-tunnel port is already
+// bound on SuperPod AND reachable as an HTTP proxy — i.e. another machine on the
+// shared account is already providing it. Used by ensureTunnel to adopt a peer's
+// tunnel instead of racing to create a duplicate on the same per-user port.
+// Only callers without a live local autossh reach this, so the SSH round-trip
+// (and proxied probe) is paid by riders, never by the provider.
+func remoteTunnelHealthy() bool {
+	if tunnelPort == "" {
+		return false
+	}
+	probe := fmt.Sprintf(
+		`ss -ltn 2>/dev/null | grep -q "127.0.0.1:%s " || exit 1
+code=$(curl -s -o /dev/null -w '%%{http_code}' -x http://127.0.0.1:%s --max-time 8 https://api.anthropic.com/v1/messages 2>/dev/null)
+[ -n "$code" ] && [ "$code" != "000" ] && echo OK`,
+		tunnelPort, tunnelPort,
+	)
+	out, err := ssh(probe)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) == "OK"
 }
 
 func stopTunnel() {
@@ -760,6 +814,58 @@ func findConnectExe() string {
 	return ""
 }
 
+// windowsUserSID returns the current Windows user's SID via whoami.exe, or "".
+func windowsUserSID() string {
+	whoami := `/mnt/c/Windows/System32/whoami.exe`
+	if _, err := os.Stat(whoami); err != nil {
+		return ""
+	}
+	out, err := exec.Command(whoami, "/user", "/fo", "csv", "/nh").Output()
+	if err != nil {
+		return ""
+	}
+	// Output: "DOMAIN\user","S-1-5-21-..."  → SID is the last comma field.
+	fields := strings.Split(strings.TrimSpace(string(out)), ",")
+	sid := strings.Trim(strings.TrimSpace(fields[len(fields)-1]), `"`)
+	if strings.HasPrefix(sid, "S-1-") {
+		return sid
+	}
+	return ""
+}
+
+// repairWinSSHConfigPerms fixes the ACL on the WSL-written Windows SSH config so
+// Windows OpenSSH (ssh.exe) accepts it. Files written from WSL via /mnt/c inherit
+// the user profile's ACEs, which often include stray, unresolvable SIDs with Write
+// access (left over from migrated/restored Windows profiles). Windows OpenSSH then
+// rejects the config with "Bad owner or permissions" and exits, which breaks VS
+// Code Remote-SSH (error: "过程试图写入的管道不存在" / "the pipe ... does not exist").
+// We break inheritance and grant only the current user, SYSTEM, and Administrators.
+// Best-effort: it warns but never fails the command, and skips entirely unless it
+// can resolve the user's SID (so it can never lock the user out of their config).
+func repairWinSSHConfigPerms(winUser string) {
+	icacls := `/mnt/c/Windows/System32/icacls.exe`
+	if _, err := os.Stat(icacls); err != nil {
+		return
+	}
+	sid := windowsUserSID()
+	if sid == "" {
+		return // can't safely grant the right user; leave perms untouched
+	}
+	configWin := fmt.Sprintf(`C:\Users\%s\.ssh\config`, winUser)
+	// /reset clears any stray *explicit* ACEs (e.g. a leftover Everyone grant);
+	// /inheritance:r then drops *inherited* ACEs (the common WSL case, where the
+	// profile's unresolvable SIDs leak in) and grants only the safe three —
+	// together yielding an exact, clean DACL regardless of how it got dirty.
+	exec.Command(icacls, configWin, "/reset").Run()
+	err := exec.Command(icacls, configWin, "/inheritance:r",
+		"/grant:r", "*"+sid+":F", "*S-1-5-18:F", "*S-1-5-32-544:F").Run() // user, SYSTEM, Administrators
+	if err != nil {
+		warn(fmt.Sprintf("修复 Windows SSH 配置权限失败（可手动 icacls 修）: %v", err))
+		return
+	}
+	ok("Windows SSH 配置权限已修正（仅 当前用户/SYSTEM/Administrators）")
+}
+
 func cmdVscode() {
 	// 1. Ensure SOCKS proxy is running
 	ensureSocks()
@@ -870,6 +976,7 @@ func cmdVscode() {
 		os.Exit(1)
 	}
 	ok(fmt.Sprintf("Windows SSH 配置已写入 C:\\Users\\%s\\.ssh\\config", winUser))
+	repairWinSSHConfigPerms(winUser)
 
 	fmt.Println()
 	info("VS Code 连接方式:")
@@ -1658,6 +1765,25 @@ func ensureRelay() bool {
 	}
 
 	// Deploy and start the TCP relay on SuperPod.
+	//
+	// Shared-account safety: the SuperPod home — and therefore this relay plus
+	// the claude/codex proxy in ~/.bashrc — is shared by every machine that
+	// logs into the same account. A second machine running spod must NOT tear
+	// down a relay another machine already started: `pkill -f spod-relay.py`
+	// kills ALL of them regardless of port, so two machines on different port
+	// schemes murder each other's relay on every spod run — a reconnect war
+	// that starves the proxy and looks exactly like "relay broken". So if a
+	// spod relay is already running (ANY ports — the other machine may use a
+	// different scheme), ADOPT it and point our proxy at its ports instead of
+	// recreating one.
+	//
+	// Escape hatch: SPOD_FORCE_RELAY=1 tears down whatever is running and
+	// rebinds the relay to THIS machine's tunnel — use it to reclaim the exit
+	// when the adopted relay routes through a dead/blocked upstream.
+	force := "0"
+	if os.Getenv("SPOD_FORCE_RELAY") == "1" {
+		force = "1"
+	}
 	script := fmt.Sprintf(
 		`mkdir -p ~/.local/bin ~/.local/share
 NEW_SCRIPT=$(cat << 'RELAY_SCRIPT'
@@ -1666,8 +1792,14 @@ RELAY_SCRIPT
 )
 OLD_SCRIPT=""
 [ -f ~/.local/bin/spod-relay.py ] && OLD_SCRIPT=$(cat ~/.local/bin/spod-relay.py)
-if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -u $(id -u) -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
-    echo "running"
+FORCE="%s"
+# Port-agnostic: find any spod-relay this account is already running and read
+# back its actual <upstream listen> ports (a peer machine may differ from us).
+RUNNING=$(pgrep -u $(id -u) -af 'spod-relay\.py' 2>/dev/null | grep -oE 'spod-relay\.py +[0-9]+ +[0-9]+' | head -1)
+RUN_UP=$(echo "$RUNNING" | awk '{print $2}')
+RUN_DOWN=$(echo "$RUNNING" | awk '{print $3}')
+if [ "$FORCE" != "1" ] && [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && [ -n "$RUN_UP" ]; then
+    echo "adopt $RUN_UP $RUN_DOWN"
 else
     pkill -u $(id -u) -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
     echo "$NEW_SCRIPT" > ~/.local/bin/spod-relay.py
@@ -1681,7 +1813,7 @@ else
     fi
 fi`,
 		relayScript,
-		tunnelPort, relayPort,
+		force,
 		tunnelPort, relayPort,
 		tunnelPort, relayPort,
 	)
@@ -1690,13 +1822,23 @@ fi`,
 		warn(fmt.Sprintf("Relay 部署失败: %v", err))
 		return false
 	}
-	switch strings.TrimSpace(out) {
-	case "running":
+	fields := strings.Fields(strings.TrimSpace(out))
+	switch {
+	case len(fields) == 3 && fields[0] == "adopt":
+		adoptUp, adoptDown := fields[1], fields[2]
+		if adoptUp != tunnelPort || adoptDown != relayPort {
+			info(fmt.Sprintf("采纳已运行的 relay (:%s→:%s)，未重建（共享账号，避免互相踢）", adoptDown, adoptUp))
+			info("要改用本机出口接管： SPOD_FORCE_RELAY=1 spod")
+		} else {
+			ok(fmt.Sprintf("Relay 运行中 (:%s→:%s)", relayPort, tunnelPort))
+		}
+		// Point the proxy at the relay that actually exists.
+		tunnelPort, relayPort = adoptUp, adoptDown
 		return true
-	case "started":
+	case len(fields) >= 1 && fields[0] == "started":
 		ok(fmt.Sprintf("Relay 已启动 (:%s → :%s，隧道断开时自动等待重连)", relayPort, tunnelPort))
 		return true
-	case "failed":
+	case len(fields) == 1 && fields[0] == "failed":
 		warn("Relay 启动失败，查看日志: /tmp/spod-relay-$(id -u).log")
 		return false
 	default:
