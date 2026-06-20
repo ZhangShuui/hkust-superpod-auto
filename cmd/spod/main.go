@@ -459,6 +459,24 @@ func ensurePorts() {
 	}
 }
 
+// pickActiveNode returns the first candidate node whose relay is live, retrying
+// each node up to `retries` times (with `delay` between attempts) before moving
+// on. Returns "" when no candidate's relay is reachable. `probe` is injected so
+// the selection logic is unit-testable without real SSH.
+func pickActiveNode(candidates []string, retries int, delay time.Duration, probe func(node string) bool) string {
+	for _, node := range candidates {
+		for attempt := 0; attempt < retries; attempt++ {
+			if probe(node) {
+				return node
+			}
+			if attempt < retries-1 {
+				time.Sleep(delay)
+			}
+		}
+	}
+	return ""
+}
+
 func ensureVPN() {
 	// A rider borrowing another machine's VPN (via SUPERPOD_SSH_PROXY → that
 	// machine's `spod socks`) has no local tun0. SPOD_NO_VPN=1 skips the check
