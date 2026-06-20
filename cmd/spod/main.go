@@ -477,6 +477,78 @@ func pickActiveNode(candidates []string, retries int, delay time.Duration, probe
 	return ""
 }
 
+// probeRiderNode reports whether `node` has a LIVE relay: it ssh's into the node
+// (through the provider's SOCKS, if configured) and asks the local relay to reach
+// OpenAI. The remote self-computes its relay port (18000+uid%1000) so this is
+// self-contained. A 405 (relay reached OpenAI) means live; anything else = dead.
+func probeRiderNode(node string) bool {
+	user := envOr("SUPERPOD_USER", "")
+	proxy := os.Getenv("SUPERPOD_SSH_PROXY")
+	remote := `p=$((18000 + $(id -u)%1000)); ` +
+		`curl -sf -x http://127.0.0.1:$p --max-time 8 -o /dev/null ` +
+		`-w '%{http_code}' https://chatgpt.com/backend-api/codex/responses`
+	sshArgs := []string{
+		"-o", "ConnectTimeout=8",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/spod-rider-%r@%h:%p",
+		"-o", "ControlPersist=60",
+	}
+	if proxy != "" {
+		sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=nc -X 5 -x %s %%h %%p", proxy))
+	}
+	target := node
+	if user != "" {
+		target = user + "@" + node
+	}
+	sshArgs = append(sshArgs, target, remote)
+	out, err := exec.Command("ssh", sshArgs...).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "405"
+}
+
+// riderConnect connects as a "rider": it borrows the provider's VPN/tunnel/relay
+// (SPOD_NO_VPN), probes the candidate login nodes for the one whose relay is live,
+// points the `superpod` ssh alias at it, then hands off to the normal connect path.
+func riderConnect(sessionArg string) {
+	// Rider has no local tun0 and must not build its own tunnel/socks — it adopts
+	// the provider's. SPOD_NO_VPN short-circuits ensureVPN(); we simply never call
+	// ensureTunnel()/ensureSocks() here.
+	os.Setenv("SPOD_NO_VPN", "1")
+
+	if os.Getenv("SUPERPOD_SSH_PROXY") == "" {
+		fail("rider 模式需经 provider 的 SOCKS：请在 .env 配 SUPERPOD_SSH_PROXY=<provider-ip>:1080")
+		os.Exit(1)
+	}
+	if envOr("SUPERPOD_USER", "") == "" {
+		fail("请在 .env 配 SUPERPOD_USER（SuperPod 账号，如 szhangfa）")
+		os.Exit(1)
+	}
+
+	candidates := strings.Fields(os.Getenv("SUPERPOD_HOSTS"))
+	if len(candidates) == 0 {
+		candidates = []string{"10.22.4.12", "10.22.4.13"} // slogin-01 优先，slogin-02 兜底
+	}
+
+	info(fmt.Sprintf("探测活节点（relay 上游存活）：%s", strings.Join(candidates, ", ")))
+	node := pickActiveNode(candidates, 3, 2*time.Second, probeRiderNode)
+	if node == "" {
+		fail("活节点未就绪（provider 隧道可能在重连），稍等重试")
+		os.Exit(1)
+	}
+	ok(fmt.Sprintf("活节点：%s（relay 通）", node))
+
+	// Point the `superpod` alias at the chosen node, then reuse the normal path.
+	os.Setenv("SUPERPOD_HOST", node)
+	ensureSSHConfig()
+
+	if sessionArg == "" {
+		cmdInteractive()
+	} else {
+		attachOrCreate(fullName(sessionArg))
+	}
+}
+
 func ensureVPN() {
 	// A rider borrowing another machine's VPN (via SUPERPOD_SSH_PROXY → that
 	// machine's `spod socks`) has no local tun0. SPOD_NO_VPN=1 skips the check
@@ -2336,6 +2408,12 @@ func main() {
 			fail(fmt.Sprintf("SSH 连接失败: %v", err))
 			os.Exit(1)
 		}
+	case "rider":
+		sessionArg := ""
+		if len(args) > 1 {
+			sessionArg = args[1]
+		}
+		riderConnect(sessionArg)
 	case "":
 		ensureTunnel()
 		cmdInteractive()
