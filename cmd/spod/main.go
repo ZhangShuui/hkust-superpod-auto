@@ -476,6 +476,20 @@ func ensureVPN() {
 	os.Exit(1)
 }
 
+// tunnelManagedExternally reports whether a systemd user unit already owns the
+// reverse tunnel. The unit runs a plain `ssh -R`, which the autossh-matching
+// tunnelPIDAndPort() can't see — so without this guard ensureTunnel would spawn
+// a competing autossh that collides on the remote port. On machines without the
+// unit (e.g. a rider colleague's box) is-active != "active" and we fall through
+// to spod's own autossh management. SPOD_FORCE_TUNNEL=1 overrides.
+func tunnelManagedExternally() bool {
+	if os.Getenv("SPOD_FORCE_TUNNEL") == "1" {
+		return false
+	}
+	out, _ := exec.Command("systemctl", "--user", "is-active", "spod-tunnel.service").Output()
+	return strings.TrimSpace(string(out)) == "active"
+}
+
 func ensureTunnel() {
 	ensureVPN()
 	// Lockfile to prevent concurrent tunnel starts
@@ -492,6 +506,11 @@ func ensureTunnel() {
 	}
 
 	ensurePorts()
+
+	if tunnelManagedExternally() {
+		ok("隧道由 systemd 守护 (spod-tunnel.service)，本机不自建")
+		return
+	}
 
 	// Clean up any stale autossh whose -R port doesn't match our expected
 	// tunnelPort. Loops so that multiple stale instances are all reaped,
@@ -689,6 +708,17 @@ func ensureSocks() {
 	pid := socksPID()
 	if pid > 0 {
 		ok(fmt.Sprintf("SOCKS5 代理运行中 (pid=%d, 0.0.0.0:%s)", pid, socksPort))
+		return
+	}
+
+	// The port may already be served by an external supervisor (e.g. a systemd
+	// unit running plain `ssh -D`), which socksPID() — matching only autossh —
+	// cannot see. Probe the port so we don't spawn a second autossh that fails
+	// ExitOnForwardFailure on the already-bound port and flaps forever. This
+	// lets `spod socks` / `spod vscode` coexist with a systemd-managed proxy.
+	if c, err := net.DialTimeout("tcp", "127.0.0.1:"+socksPort, time.Second); err == nil {
+		c.Close()
+		ok(fmt.Sprintf("SOCKS5 代理已在运行 (0.0.0.0:%s 已监听，外部托管)", socksPort))
 		return
 	}
 
