@@ -515,6 +515,11 @@ func riderConnect(sessionArg string) {
 	// the provider's. SPOD_NO_VPN short-circuits ensureVPN(); we simply never call
 	// ensureTunnel()/ensureSocks() here.
 	os.Setenv("SPOD_NO_VPN", "1")
+	// Rider borrows the provider's already-running relay (just probed live) — it
+	// must never deploy or pkill the relay on the shared account (that restarts a
+	// reconnect war on version skew). SPOD_RIDER makes ensureRemoteSetup skip
+	// ensureRelay and point the proxy straight at the live relay port.
+	os.Setenv("SPOD_RIDER", "1")
 
 	if os.Getenv("SUPERPOD_SSH_PROXY") == "" {
 		fail("rider 模式需经 provider 的 SOCKS：请在 .env 配 SUPERPOD_SSH_PROXY=<provider-ip>:1080")
@@ -1970,7 +1975,16 @@ fi`,
 func ensureRemoteSetup() {
 	// Relay first (computes per-user ports); proxy config rides the relay
 	// if it came up, otherwise points direct to the tunnel.
-	relayOK := ensureRelay()
+	var relayOK bool
+	if os.Getenv("SPOD_RIDER") == "1" {
+		// Rider borrows the provider's already-running relay — never deploy or
+		// pkill it on the shared account. Still compute ports so the proxy can
+		// point at the live relay port the provider published.
+		ensurePorts()
+		relayOK = relayPort != ""
+	} else {
+		relayOK = ensureRelay()
+	}
 	ensureTmuxConfAndProxy(relayOK)
 	ensureRemoteCLIs()
 }
