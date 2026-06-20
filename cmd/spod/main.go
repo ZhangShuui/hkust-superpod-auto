@@ -485,7 +485,7 @@ func probeRiderNode(node string) bool {
 	user := envOr("SUPERPOD_USER", "")
 	proxy := os.Getenv("SUPERPOD_SSH_PROXY")
 	remote := `p=$((18000 + $(id -u)%1000)); ` +
-		`curl -sf -x http://127.0.0.1:$p --max-time 8 -o /dev/null ` +
+		`curl -s -x http://127.0.0.1:$p --max-time 8 -o /dev/null ` +
 		`-w '%{http_code}' https://chatgpt.com/backend-api/codex/responses`
 	sshArgs := []string{
 		"-o", "ConnectTimeout=8",
