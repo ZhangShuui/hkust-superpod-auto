@@ -2294,6 +2294,7 @@ func cmdHelp() {
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
+		{"spod rider", "借用 provider 的 SOCKS，自动连到 relay 活的登录节点"},
 		{"spod creds", "同步本地凭证到 SuperPod"},
 		{"spod uptime", "查看 login 节点启动时间和负载"},
 	}
