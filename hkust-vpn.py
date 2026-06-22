@@ -186,6 +186,48 @@ def _dump_page_debug(page, label):
         log.warning(f"[!] HTML/text dump failed: {ex}")
 
 
+# JS expression that switches Microsoft's login to the password path. Microsoft
+# now interrupts the email->password flow with an Authenticator-first screen, so
+# we click whatever reveals the password field. Returns a short tag, else null.
+_SWITCH_TO_PASSWORD_JS = r"""() => {
+    // (a) "Approve sign in" push / TOTP screen: stable-id "Use your password
+    //     instead" link.
+    const link = document.querySelector('#idA_PWD_SwitchToPassword');
+    if (link) { try { link.click(); } catch (e) {} return 'switch_link'; }
+    // (b) "Choose a way to sign in" credential picker: the password tile
+    //     (aria-label "Use my password"), plus a text fallback for variants.
+    const cands = document.querySelectorAll(
+        '[role=button][aria-label], #credentialList [role=button], a, button, li, div[role=button]');
+    for (const el of cands) {
+        const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+        if (!label || label.length > 80) continue;
+        if (/use (my|your) password/i.test(label)) {
+            const clickable = el.closest('[role=button], a, button') || el;
+            try { clickable.click(); } catch (e) {}
+            return 'password_tile';
+        }
+    }
+    return null;
+}"""
+
+
+def switch_to_password(page):
+    """Force the password login path when Microsoft shows an Authenticator-first
+    interrupt.
+
+    After the email step Microsoft may show a "Choose a way to sign in" picker or
+    jump straight to an "Approve sign in" push screen instead of the password
+    field. Click the control that switches to password login and return a short
+    tag for what was clicked, or None when no such control is present (e.g. the
+    password field is already on screen). Safe to call repeatedly.
+    """
+    try:
+        return page.evaluate(_SWITCH_TO_PASSWORD_JS)
+    except Exception as e:
+        log.warning(f"[!] switch_to_password probe failed: {e}")
+        return None
+
+
 def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
     """Fully automated: open browser, login, MFA via TOTP, return DSID cookie.
 
@@ -249,12 +291,29 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             log.info(f"[+] Email: {user}")
 
             # ── Step 2: Enter password ──
+            # Microsoft now often interrupts here with an Authenticator-first
+            # screen — a "Choose a way to sign in" picker, or a direct "Approve
+            # sign in" push page — instead of the password field. The field only
+            # appears after clicking "Use my password" / "Use your password
+            # instead". Poll: take the field as soon as it shows; otherwise keep
+            # switching to the password method. Backwards-compatible with the old
+            # direct-to-password flow (switch_to_password returns None then).
             log.info("[*] Step 2/5: Entering password...")
-            try:
-                page.wait_for_selector('input[name="passwd"]', state="visible", timeout=45000)
-            except Exception:
+            passwd_deadline = time.monotonic() + 60
+            last_switch = None
+            while time.monotonic() < passwd_deadline:
+                try:
+                    page.wait_for_selector('input[name="passwd"]', state="visible", timeout=3000)
+                    break
+                except Exception:
+                    switched = switch_to_password(page)
+                    if switched and switched != last_switch:
+                        log.info(f"[*]  -> Authenticator-first screen; switching to password ({switched})")
+                        last_switch = switched
+                        page.wait_for_timeout(2000)
+            else:
                 _dump_page_debug(page, "step2-wait-passwd-fail")
-                raise
+                raise Exception("password field did not appear (Authenticator-first interrupt not cleared)")
             page.wait_for_timeout(500)
             page.fill('input[name="passwd"]', password)
             page.wait_for_timeout(300)
