@@ -459,6 +459,101 @@ func ensurePorts() {
 	}
 }
 
+// pickActiveNode returns the first candidate node whose relay is live, retrying
+// each node up to `retries` times (with `delay` between attempts) before moving
+// on. Returns "" when no candidate's relay is reachable. `probe` is injected so
+// the selection logic is unit-testable without real SSH.
+func pickActiveNode(candidates []string, retries int, delay time.Duration, probe func(node string) bool) string {
+	for _, node := range candidates {
+		for attempt := 0; attempt < retries; attempt++ {
+			if probe(node) {
+				return node
+			}
+			if attempt < retries-1 {
+				time.Sleep(delay)
+			}
+		}
+	}
+	return ""
+}
+
+// probeRiderNode reports whether `node` has a LIVE relay: it ssh's into the node
+// (through the provider's SOCKS, if configured) and asks the local relay to reach
+// OpenAI. The remote self-computes its relay port (18000+uid%1000) so this is
+// self-contained. A 405 (relay reached OpenAI) means live; anything else = dead.
+func probeRiderNode(node string) bool {
+	user := envOr("SUPERPOD_USER", "")
+	proxy := os.Getenv("SUPERPOD_SSH_PROXY")
+	remote := `p=$((18000 + $(id -u)%1000)); ` +
+		`curl -s -x http://127.0.0.1:$p --max-time 8 -o /dev/null ` +
+		`-w '%{http_code}' https://chatgpt.com/backend-api/codex/responses`
+	sshArgs := []string{
+		"-o", "ConnectTimeout=8",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/spod-rider-%r@%h:%p",
+		"-o", "ControlPersist=60",
+	}
+	if proxy != "" {
+		sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=nc -X 5 -x %s %%h %%p", proxy))
+	}
+	target := node
+	if user != "" {
+		target = user + "@" + node
+	}
+	sshArgs = append(sshArgs, target, remote)
+	out, err := exec.Command("ssh", sshArgs...).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "405"
+}
+
+// riderConnect connects as a "rider": it borrows the provider's VPN/tunnel/relay
+// (SPOD_NO_VPN), probes the candidate login nodes for the one whose relay is live,
+// points the `superpod` ssh alias at it, then hands off to the normal connect path.
+func riderConnect(sessionArg string) {
+	// Rider has no local tun0 and must not build its own tunnel/socks — it adopts
+	// the provider's. SPOD_NO_VPN short-circuits ensureVPN(); we simply never call
+	// ensureTunnel()/ensureSocks() here.
+	os.Setenv("SPOD_NO_VPN", "1")
+	// Rider borrows the provider's already-running relay (just probed live) — it
+	// must never deploy or pkill the relay on the shared account (that restarts a
+	// reconnect war on version skew). SPOD_RIDER makes ensureRemoteSetup skip
+	// ensureRelay and point the proxy straight at the live relay port.
+	os.Setenv("SPOD_RIDER", "1")
+
+	if os.Getenv("SUPERPOD_SSH_PROXY") == "" {
+		fail("rider 模式需经 provider 的 SOCKS：请在 .env 配 SUPERPOD_SSH_PROXY=<provider-ip>:1080")
+		os.Exit(1)
+	}
+	if envOr("SUPERPOD_USER", "") == "" {
+		fail("请在 .env 配 SUPERPOD_USER（SuperPod 账号，如 szhangfa）")
+		os.Exit(1)
+	}
+
+	candidates := strings.Fields(os.Getenv("SUPERPOD_HOSTS"))
+	if len(candidates) == 0 {
+		candidates = []string{"10.22.4.12", "10.22.4.13"} // slogin-01 优先，slogin-02 兜底
+	}
+
+	info(fmt.Sprintf("探测活节点（relay 上游存活）：%s", strings.Join(candidates, ", ")))
+	node := pickActiveNode(candidates, 3, 2*time.Second, probeRiderNode)
+	if node == "" {
+		fail("活节点未就绪（provider 隧道可能在重连），稍等重试")
+		os.Exit(1)
+	}
+	ok(fmt.Sprintf("活节点：%s（relay 通）", node))
+
+	// Point the `superpod` alias at the chosen node, then reuse the normal path.
+	os.Setenv("SUPERPOD_HOST", node)
+	ensureSSHConfig()
+
+	if sessionArg == "" {
+		cmdInteractive()
+	} else {
+		attachOrCreate(fullName(sessionArg))
+	}
+}
+
 func ensureVPN() {
 	// A rider borrowing another machine's VPN (via SUPERPOD_SSH_PROXY → that
 	// machine's `spod socks`) has no local tun0. SPOD_NO_VPN=1 skips the check
@@ -474,6 +569,20 @@ func ensureVPN() {
 	info("运行 `spod vpn` 启动 VPN")
 	info("（借用他人 VPN 时用 SPOD_NO_VPN=1 跳过此检查）")
 	os.Exit(1)
+}
+
+// tunnelManagedExternally reports whether a systemd user unit already owns the
+// reverse tunnel. The unit runs a plain `ssh -R`, which the autossh-matching
+// tunnelPIDAndPort() can't see — so without this guard ensureTunnel would spawn
+// a competing autossh that collides on the remote port. On machines without the
+// unit (e.g. a rider colleague's box) is-active != "active" and we fall through
+// to spod's own autossh management. SPOD_FORCE_TUNNEL=1 overrides.
+func tunnelManagedExternally() bool {
+	if os.Getenv("SPOD_FORCE_TUNNEL") == "1" {
+		return false
+	}
+	out, _ := exec.Command("systemctl", "--user", "is-active", "spod-tunnel.service").Output()
+	return strings.TrimSpace(string(out)) == "active"
 }
 
 func ensureTunnel() {
@@ -492,6 +601,11 @@ func ensureTunnel() {
 	}
 
 	ensurePorts()
+
+	if tunnelManagedExternally() {
+		ok("隧道由 systemd 守护 (spod-tunnel.service)，本机不自建")
+		return
+	}
 
 	// Clean up any stale autossh whose -R port doesn't match our expected
 	// tunnelPort. Loops so that multiple stale instances are all reaped,
@@ -689,6 +803,17 @@ func ensureSocks() {
 	pid := socksPID()
 	if pid > 0 {
 		ok(fmt.Sprintf("SOCKS5 代理运行中 (pid=%d, 0.0.0.0:%s)", pid, socksPort))
+		return
+	}
+
+	// The port may already be served by an external supervisor (e.g. a systemd
+	// unit running plain `ssh -D`), which socksPID() — matching only autossh —
+	// cannot see. Probe the port so we don't spawn a second autossh that fails
+	// ExitOnForwardFailure on the already-bound port and flaps forever. This
+	// lets `spod socks` / `spod vscode` coexist with a systemd-managed proxy.
+	if c, err := net.DialTimeout("tcp", "127.0.0.1:"+socksPort, time.Second); err == nil {
+		c.Close()
+		ok(fmt.Sprintf("SOCKS5 代理已在运行 (0.0.0.0:%s 已监听，外部托管)", socksPort))
 		return
 	}
 
@@ -1850,7 +1975,16 @@ fi`,
 func ensureRemoteSetup() {
 	// Relay first (computes per-user ports); proxy config rides the relay
 	// if it came up, otherwise points direct to the tunnel.
-	relayOK := ensureRelay()
+	var relayOK bool
+	if os.Getenv("SPOD_RIDER") == "1" {
+		// Rider borrows the provider's already-running relay — never deploy or
+		// pkill it on the shared account. Still compute ports so the proxy can
+		// point at the live relay port the provider published.
+		ensurePorts()
+		relayOK = relayPort != ""
+	} else {
+		relayOK = ensureRelay()
+	}
 	ensureTmuxConfAndProxy(relayOK)
 	ensureRemoteCLIs()
 }
@@ -2174,6 +2308,7 @@ func cmdHelp() {
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
+		{"spod rider", "借用 provider 的 SOCKS，自动连到 relay 活的登录节点"},
 		{"spod creds", "同步本地凭证到 SuperPod"},
 		{"spod uptime", "查看 login 节点启动时间和负载"},
 	}
@@ -2288,6 +2423,12 @@ func main() {
 			fail(fmt.Sprintf("SSH 连接失败: %v", err))
 			os.Exit(1)
 		}
+	case "rider":
+		sessionArg := ""
+		if len(args) > 1 {
+			sessionArg = args[1]
+		}
+		riderConnect(sessionArg)
 	case "":
 		ensureTunnel()
 		cmdInteractive()
