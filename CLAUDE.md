@@ -73,7 +73,27 @@ spod vscode         # One-command setup for Windows VS Code Remote-SSH
 spod socks          # Start SOCKS5 proxy for Windows access
 spod socks status   # Check SOCKS5 proxy status
 spod socks stop     # Stop SOCKS5 proxy
+spod get <path>...  # Pull files to Windows Downloads (glob OK, MD5-verified, resumable)
 ```
+
+### Pulling files off SuperPod
+
+```bash
+spod get /project/foo/bar.mp4                    # → C:\Users\<you>\Downloads
+spod get '/project/foo/*.mp4'                    # globs expand on the remote
+spod get /project/foo/a.mp4 -o 'C:\Users\me\Desktop'   # Windows paths accepted
+spod get /project/foo/a.mp4 -o ./data            # or any local dir
+```
+
+`spod get` records each file's MD5 **before** transferring, then verifies after.
+This matters because a job can unlink a file mid-transfer: NFS silly-renames it
+to `.nfsXXXX`, rsync still exits 0, and the original path is gone — leaving
+nothing to check against unless the digest was taken up front. Re-running the
+same command resumes from where it stopped (`--append-verify`).
+
+Transfers are deliberately a **single** rsync stream: the VPN link saturates at
+about one stream's bandwidth, and splitting into parallel streams measurably
+lowers aggregate throughput (measured 255 KB/s single vs 115+93 KB/s split).
 
 ## SuperPod Remote Setup
 

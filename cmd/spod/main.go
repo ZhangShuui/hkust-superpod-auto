@@ -1611,6 +1611,356 @@ func cmdSyncStop() {
 	ok("已停止所有 rsync")
 }
 
+// ── Get (pull individual files) ──
+
+// winPathRe matches a Windows drive path like C:\Users\foo or D:/bar.
+var winPathRe = regexp.MustCompile(`^([A-Za-z]):[\\/](.*)$`)
+
+// toWSLPath converts `C:\Users\Win11\Downloads` → `/mnt/c/Users/Win11/Downloads`.
+// Non-Windows paths pass through untouched.
+func toWSLPath(p string) string {
+	m := winPathRe.FindStringSubmatch(p)
+	if m == nil {
+		return p
+	}
+	return "/mnt/" + strings.ToLower(m[1]) + "/" + strings.ReplaceAll(m[2], `\`, "/")
+}
+
+// defaultDownloadDir returns the Windows Downloads folder when running under
+// WSL (that's where pulled files are almost always wanted), else the cwd.
+func defaultDownloadDir() string {
+	if u := findWindowsUser(); u != "" {
+		d := filepath.Join("/mnt/c/Users", u, "Downloads")
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			return d
+		}
+	}
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
+// ── Progress bar ──
+
+func stderrIsTTY() bool {
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func humanBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(b)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", b)
+}
+
+func humanDuration(d time.Duration) string {
+	if d < 0 || d > 99*time.Hour {
+		return "--:--"
+	}
+	total := int(d.Seconds())
+	if h := total / 3600; h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, (total%3600)/60, total%60)
+	}
+	return fmt.Sprintf("%02d:%02d", total/60, total%60)
+}
+
+// localBytes sums what has landed in dest so far. --append-verify writes
+// straight to the destination filename, but fall back to rsync's `.name.XXXXXX`
+// temp file so the bar still moves if that ever changes.
+func localBytes(dest string, names []string) int64 {
+	var total int64
+	for _, n := range names {
+		if fi, err := os.Stat(filepath.Join(dest, n)); err == nil {
+			total += fi.Size()
+			continue
+		}
+		matches, _ := filepath.Glob(filepath.Join(dest, "."+n+".*"))
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err == nil {
+				total += fi.Size()
+			}
+		}
+	}
+	return total
+}
+
+// renderBar draws a single-line progress bar on stderr, overwriting in place.
+func renderBar(done, total int64, rate float64, label string) {
+	const width = 28
+	frac := 0.0
+	if total > 0 {
+		frac = float64(done) / float64(total)
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(frac * width)
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+
+	eta := "--:--"
+	if rate > 0 && total > done {
+		eta = humanDuration(time.Duration(float64(total-done)/rate) * time.Second)
+	}
+	speed := "  --  "
+	if rate > 0 {
+		speed = humanBytes(int64(rate)) + "/s"
+	}
+
+	line := fmt.Sprintf("  %s▕%s%s%s▏%s %3.0f%%  %s/%s  %s  ETA %s  %s%s%s",
+		cGray, reset, bar, cGray, reset,
+		frac*100, humanBytes(done), humanBytes(total), speed, eta,
+		cGray, label, reset)
+	fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
+}
+
+// progressBar polls dest until stop is closed, drawing a bar. Speed is measured
+// over a trailing window so a stalled or bursty link doesn't swing the ETA.
+func progressBar(dest string, names []string, total int64, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	if !stderrIsTTY() {
+		return
+	}
+	const tick = 500 * time.Millisecond
+	const window = 10 // samples → 5s trailing window
+
+	start := localBytes(dest, names)
+	samples := []int64{start}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			cur := localBytes(dest, names)
+			renderBar(cur, total, 0, "")
+			fmt.Fprint(os.Stderr, "\r\033[K")
+			return
+		case <-ticker.C:
+			cur := localBytes(dest, names)
+			samples = append(samples, cur)
+			if len(samples) > window+1 {
+				samples = samples[len(samples)-(window+1):]
+			}
+			rate := 0.0
+			if n := len(samples); n > 1 {
+				elapsed := time.Duration(n-1) * tick
+				rate = float64(samples[n-1]-samples[0]) / elapsed.Seconds()
+			}
+			label := ""
+			if len(names) > 1 {
+				fin := 0
+				for _, nm := range names {
+					if _, err := os.Stat(filepath.Join(dest, nm)); err == nil {
+						fin++
+					}
+				}
+				if fin > len(names) {
+					fin = len(names)
+				}
+				label = fmt.Sprintf("(%d/%d 文件)", fin, len(names))
+			}
+			renderBar(cur, total, rate, label)
+		}
+	}
+}
+
+// cmdGet pulls one or more remote files to a local directory, verifying each
+// by MD5 against the checksum taken *before* the transfer.
+//
+// Why the pre-transfer checksum: a job on SuperPod can unlink a file while
+// we're still reading it. NFS silly-renames it to `.nfsXXXX` instead of
+// deleting, so rsync finishes cleanly (exit 0) but the original path is gone
+// and there is nothing left to verify against afterwards. Grabbing the digest
+// up front means a completed transfer can always be proven intact.
+//
+// Transfers run as a single rsync stream on purpose. The VPN link saturates at
+// roughly one stream's worth of bandwidth; splitting into parallel streams
+// measurably *lowers* aggregate throughput, so there is nothing to win here.
+func cmdGet(args []string) {
+	// Parse: spod get <remote>... [-o <dest>]
+	var remotes []string
+	dest := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o", "--out":
+			if i+1 >= len(args) {
+				fail("-o 需要一个目标目录")
+				os.Exit(1)
+			}
+			dest = args[i+1]
+			i++
+		default:
+			remotes = append(remotes, args[i])
+		}
+	}
+
+	if len(remotes) == 0 {
+		fail("用法: spod get <远程路径>... [-o <本地目录>]")
+		info(`示例: spod get /project/foo/a.mp4`)
+		info(`示例: spod get '/project/foo/*.mp4' -o .`)
+		info(`示例: spod get /project/foo/a.mp4 -o 'C:\Users\Win11\Desktop'`)
+		info("默认下载到 Windows 的 Downloads 文件夹")
+		os.Exit(1)
+	}
+
+	if dest == "" {
+		dest = defaultDownloadDir()
+	}
+	dest = toWSLPath(dest)
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		fail(fmt.Sprintf("创建目录失败: %v", err))
+		os.Exit(1)
+	}
+
+	ensureVPN()
+
+	// Expand globs remotely and drop anything that isn't a readable regular file.
+	info("解析远程路径...")
+	var quoted []string
+	for _, r := range remotes {
+		quoted = append(quoted, "'"+strings.ReplaceAll(r, "'", `'\''`)+"'")
+	}
+	listing, err := ssh("for p in " + strings.Join(quoted, " ") + `; do for f in $p; do [ -f "$f" ] && [ -r "$f" ] && printf '%s\t%s\n' "$(stat -c %s "$f")" "$f"; done; done`)
+	if err != nil && listing == "" {
+		fail(fmt.Sprintf("列出远程文件失败: %v", err))
+		os.Exit(1)
+	}
+	var files []string
+	var totalBytes int64
+	for _, l := range strings.Split(listing, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		szStr, path, cut := strings.Cut(l, "\t")
+		if !cut {
+			continue
+		}
+		sz, _ := strconv.ParseInt(szStr, 10, 64)
+		files = append(files, path)
+		totalBytes += sz
+	}
+	if len(files) == 0 {
+		fail("没有匹配到可读的远程文件")
+		os.Exit(1)
+	}
+	for _, f := range files {
+		info("  " + f)
+	}
+	info(fmt.Sprintf("共 %d 个文件, %s", len(files), humanBytes(totalBytes)))
+
+	// Snapshot checksums before pulling — see the comment on cmdGet.
+	info(fmt.Sprintf("计算远端 MD5（%d 个文件）...", len(files)))
+	var shellList []string
+	for _, f := range files {
+		shellList = append(shellList, "'"+strings.ReplaceAll(f, "'", `'\''`)+"'")
+	}
+	sums, err := ssh("md5sum " + strings.Join(shellList, " "))
+	want := map[string]string{} // basename → md5
+	if err != nil {
+		warn(fmt.Sprintf("远端 MD5 失败，将跳过校验: %v", err))
+	} else {
+		for _, line := range strings.Split(sums, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) >= 2 {
+				want[filepath.Base(strings.Join(f[1:], " "))] = f[0]
+			}
+		}
+	}
+
+	// rsync --files-from avoids all shell quoting on the remote side; paths in
+	// the list are relative to the remote root, and --no-relative flattens them
+	// into dest instead of recreating /project/... underneath it.
+	listFile, err := os.CreateTemp("", "spod-get-*.list")
+	if err != nil {
+		fail(fmt.Sprintf("创建临时文件失败: %v", err))
+		os.Exit(1)
+	}
+	defer os.Remove(listFile.Name())
+	for _, f := range files {
+		fmt.Fprintln(listFile, strings.TrimPrefix(f, "/"))
+	}
+	listFile.Close()
+
+	info(fmt.Sprintf("下载到 %s ...", dest))
+	rsyncArgs := []string{
+		"-rt", "--partial", "--append-verify", "--no-relative",
+		"--no-perms", "--no-owner", "--no-group", "--quiet",
+		"--files-from=" + listFile.Name(),
+		host + ":/", dest + "/",
+	}
+	rc := exec.Command("rsync", rsyncArgs...)
+	var rsyncErrBuf bytes.Buffer
+	rc.Stdout = os.Stdout
+	rc.Stderr = &rsyncErrBuf
+
+	// Own progress bar rather than rsync's --info=progress2: it reports totals
+	// across the whole file set the way we want, survives the multi-file case,
+	// and keeps the output on one line.
+	var basenames []string
+	for _, f := range files {
+		basenames = append(basenames, filepath.Base(f))
+	}
+	stop, barDone := make(chan struct{}), make(chan struct{})
+	if err := rc.Start(); err != nil {
+		fail(fmt.Sprintf("启动 rsync 失败: %v", err))
+		os.Exit(1)
+	}
+	go progressBar(dest, basenames, totalBytes, stop, barDone)
+	rsyncErr := rc.Wait()
+	close(stop)
+	<-barDone
+
+	if rsyncErr != nil {
+		if msg := strings.TrimSpace(rsyncErrBuf.String()); msg != "" {
+			fail(msg)
+		}
+		fail(fmt.Sprintf("rsync 失败: %v", rsyncErr))
+		info("已传输的部分会保留，重跑同一条命令可断点续传")
+		os.Exit(1)
+	}
+
+	// Verify.
+	bad := 0
+	for _, f := range files {
+		base := filepath.Base(f)
+		local := filepath.Join(dest, base)
+		fi, err := os.Stat(local)
+		if err != nil {
+			fail(base + " — 本地文件缺失")
+			bad++
+			continue
+		}
+		exp, haveSum := want[base]
+		if !haveSum {
+			warn(fmt.Sprintf("%s (%s) — 无远端 MD5，未校验", base, humanBytes(fi.Size())))
+			continue
+		}
+		out, err := exec.Command("md5sum", local).Output()
+		got := ""
+		if err == nil {
+			got = strings.Fields(string(out))[0]
+		}
+		if got == exp {
+			ok(fmt.Sprintf("%s (%s) — MD5 校验通过", base, humanBytes(fi.Size())))
+		} else {
+			fail(fmt.Sprintf("%s — MD5 不匹配（远端 %s / 本地 %s）", base, exp, got))
+			bad++
+		}
+	}
+
+	if bad > 0 {
+		fail(fmt.Sprintf("%d 个文件校验未通过 — 重跑同一条命令可续传/重取", bad))
+		os.Exit(1)
+	}
+	ok(fmt.Sprintf("全部完成 → %s", dest))
+}
+
 // ── Speedtest ──
 
 func cmdSpeedtest(durationStr string) {
@@ -2304,6 +2654,7 @@ func cmdHelp() {
 		{"spod socks stop", "关闭 SOCKS5 代理"},
 		{"spod socks status", "查看 SOCKS5 代理状态"},
 		{"spod vscode", "配置 Windows VS Code Remote-SSH"},
+		{"spod get <路径>...", "拉文件到本地（默认 Windows Downloads，带 MD5 校验）"},
 		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
@@ -2403,6 +2754,8 @@ func main() {
 			}
 			cmdSync(remote, local)
 		}
+	case "get":
+		cmdGet(args[1:])
 	case "speed":
 		dur := ""
 		if len(args) > 1 {
