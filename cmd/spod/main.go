@@ -2352,12 +2352,16 @@ func cmdGet(args []string) {
 	ensureVPN()
 
 	// Expand globs remotely and drop anything that isn't a readable regular file.
+	// stat needs -L: without it a symlink reports the length of the link text
+	// (~98 bytes), so the chunked pull copies only that much while md5sum —
+	// which does follow the link — hashes the real file, and every symlinked
+	// file fails verification instead of downloading.
 	info("解析远程路径...")
 	var quoted []string
 	for _, r := range remotes {
 		quoted = append(quoted, "'"+strings.ReplaceAll(r, "'", `'\''`)+"'")
 	}
-	listing, err := ssh("for p in " + strings.Join(quoted, " ") + `; do for f in $p; do [ -f "$f" ] && [ -r "$f" ] && printf '%s\t%s\n' "$(stat -c %s "$f")" "$f"; done; done`)
+	listing, err := ssh("for p in " + strings.Join(quoted, " ") + `; do for f in $p; do [ -f "$f" ] && [ -r "$f" ] && printf '%s\t%s\n' "$(stat -Lc %s "$f")" "$f"; done; done`)
 	if err != nil && listing == "" {
 		fail(fmt.Sprintf("列出远程文件失败: %v", err))
 		os.Exit(1)
