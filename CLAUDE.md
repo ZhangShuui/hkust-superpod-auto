@@ -34,7 +34,7 @@ The sudo password is in `.env` as `SUDO_PASSWORD`.
 
 ## Project Overview
 
-One-command toolkit for connecting to HKUST SuperPod HPC from WSL2 and running Claude Code on it.
+One-command toolkit for connecting to HKUST SuperPod (and HPC4) from WSL2 and running Claude Code on it.
 
 ## Key Components
 
@@ -74,7 +74,32 @@ spod socks          # Start SOCKS5 proxy for Windows access
 spod socks status   # Check SOCKS5 proxy status
 spod socks stop     # Stop SOCKS5 proxy
 spod get <path>...  # Pull files to Windows Downloads (glob OK, MD5-verified, resumable)
+
+spod hpc4           # Same commands against HPC4 — see below
 ```
+
+### Two clusters, side by side
+
+`spod hpc4 <subcommand>` runs any of the above against HPC4 (`hpc4.ust.hk`)
+instead of SuperPod. Everything per-cluster is separate — ssh alias, reverse
+tunnel, relay, SOCKS port, `/tmp` lock files, cached remote UID, tmux sessions —
+so `spod` and `spod hpc4` can be used at the same time without one disturbing
+the other:
+
+```bash
+spod                spod hpc4                # two independent tmux sessions
+spod get /a/b.mp4   spod hpc4 get /a/b.mp4   # two independent tunnels/relays
+spod socks          spod hpc4 socks          # local :1080 vs :1081
+spod vpn status                              # one VPN, reports both clusters
+```
+
+Config lives in `.env` (`HPC4_USER`, optional `HPC4_HOST`/`HPC4_SSH_HOST`/
+`HPC4_SOCKS_PORT`/`HPC4_TUNNEL_PORT`/`HPC4_RELAY_PORT`). The VPN is shared;
+`spod vpn` and `spod rider` stay SuperPod-scoped (rider borrows a provider's
+SuperPod tunnel and refuses to run under `hpc4`).
+
+Adding a third cluster is a `targets` map entry in `main.go` plus its `.env`
+keys — nothing else in the command layer is cluster-aware.
 
 ### Pulling files off SuperPod
 
@@ -131,11 +156,13 @@ Codex is installed globally in the `claude` conda env on SuperPod (`npm install 
 ## Critical Gotchas
 
 - **The VPN runs with ESP/UDP disabled, and that is the bandwidth ceiling.** Because openconnect is launched with `--proxy http://127.0.0.1:7890`, its datagram channel cannot traverse the HTTP CONNECT proxy — the log says `Set up UDP failed; using SSL instead` / `ESP disabled`, and every packet becomes TCP-over-TCP through Clash. Result: inner RTT 233–494 ms with `cwnd` stuck at 2–5 segments, so one TCP flow tops out near 255 KB/s. Diagnose with `grep -E "ESP|UDP failed" vpn.log` and `ss -tino | grep -A1 143.89`. Clash itself is *not* the cap (measured 1.77 MB/s to Cloudflare). Note `remote.ust.hk` is reachable without the proxy (~127 ms), but this machine's raw ISP path to the internet is much slower than Clash (126 KB/s vs 1.77 MB/s), so dropping `--proxy` to regain ESP is a real experiment, not an obvious win — measure before changing it.
+- **The VPN is split-tunnel: a cluster missing from `VPN_HOSTS` resolves but never connects.** vpn-slice installs a `/32` via tun0 only for the hosts listed in `VPN_HOSTS`, so `hpc4.ust.hk` (143.89.184.3) answers DNS from the public resolver, looks configured, and then its packets leave via eth0 and hang until timeout. `.env` now sets `VPN_HOSTS="superpod.ust.hk hpc4.ust.hk"`; on an already-running VPN, `ensureRoute()` adds the missing route in place (sudo, `SUDO_PASSWORD` from `.env`) so no restart is needed. Diagnose with `ip route get 143.89.184.3` — it must say `dev tun0`.
+- **Never let autossh loose on an account you can't key into.** It has no tty for a password and retries forever, so a wrong username turns into an endless stream of failed logins — and enough of those lock the ITSC account, which takes the VPN down with it. `ensureTunnel`/`ensureSocks` gate on `sshAuthOK()` (a single `BatchMode=yes` probe) and skip the tunnel with a `ssh-copy-id` hint instead. For the same reason `ssh()` never retries a `Permission denied` or `Host key verification failed` (`isFatalSSHErr`), and runs with `BatchMode=yes` so an unattended call can't stall on a password prompt.
 - **vpn-slice must exist at `.venv/bin/vpn-slice`** — openconnect calls it as a script. If missing, VPN connects but routing breaks and SSH port 22 is unreachable despite ping working.
 - **VPN script uses system python** (`python3 hkust-vpn.py`) but references `.venv/bin/vpn-slice` as path. The system python needs `pyotp` and `playwright` installed (or use .venv python).
 - **Clash proxy on port 7890** must be running locally before VPN connects (openconnect uses it as `--proxy`).
 - `.env` has real passwords and TOTP secret — never commit, never log.
-- SSH config entry `Host superpod` is auto-synced by `spod` on every run (via `ensureSSHConfig()`).
+- SSH config entries `Host superpod` / `Host hpc4` are auto-synced by `spod` on every run (via `ensureSSHConfig()`), one block per cluster configured in `.env`.
 - SuperPod login nodes: NO computation. Always use `srun` for GPU work.
 - **SOCKS proxy hairpin NAT** — `superpod.ust.hk` resolves to public IP which SuperPod can't reach from inside. `spod vscode` handles this automatically by using internal IP.
 - **Windows SSH needs its own key** — WSL and Windows have different SSH keys. `spod vscode` auto-adds Windows public key to SuperPod's `~/.ssh/authorized_keys`.

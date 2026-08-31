@@ -4,7 +4,7 @@
 
 ## `spod` CLI
 
-Go 编写的统一入口，管理 VPN、SSH 隧道、tmux 多会话。
+Go 编写的统一入口，管理 VPN、SSH 隧道、tmux 多会话；SuperPod 与 HPC4 两个集群共用一套命令。
 
 ```bash
 # ── VPN ──
@@ -34,7 +34,39 @@ spod vscode           # 一键配置 Windows VS Code Remote-SSH
 spod socks            # 启动 SOCKS5 代理（Windows 可通过 127.0.0.1:1080 接入）
 spod socks status     # 查看 SOCKS5 代理状态
 spod socks stop       # 关闭 SOCKS5 代理
+
+# ── HPC4 ──
+spod hpc4             # 上面的子命令都能加 hpc4 前缀，走 HPC4 集群
+spod hpc4 ls          # 例：列 HPC4 上的会话
+spod hpc4 get <path>  # 例：从 HPC4 拉文件
 ```
+
+### 两个集群同时用
+
+`spod hpc4 <子命令>` 把同一条命令换到 HPC4（`hpc4.ust.hk`）执行。两边的 ssh
+别名、反向隧道、relay、SOCKS 端口、`/tmp` 锁文件、远端 UID 缓存、tmux 会话
+全部各自独立，可以同时开着互不干扰：
+
+```bash
+spod                spod hpc4                # 两套 tmux 会话
+spod get /a/b.mp4   spod hpc4 get /a/b.mp4   # 两套隧道 / relay
+spod socks          spod hpc4 socks          # 本地 :1080 与 :1081
+spod vpn status                              # 共用一条 VPN，同时报两个集群
+```
+
+配置写在 `.env`：`HPC4_USER` 必填，`HPC4_HOST` / `HPC4_SSH_HOST` /
+`HPC4_SOCKS_PORT` / `HPC4_TUNNEL_PORT` / `HPC4_RELAY_PORT` 可选。
+
+两个注意点：
+
+- `VPN_HOSTS` 必须包含 `hpc4.ust.hk`。VPN 是分流的，只给列出来的主机加 tun0
+  路由；漏了的话域名照样解析得到，但包从 eth0 出去，连接一直卡到超时。
+  VPN 已经在跑时 spod 会就地补这条路由（用 `.env` 里的 `SUDO_PASSWORD`），
+  不用重启 VPN。
+- HPC4 需要免密登录（`ssh-copy-id hpc4`）。autossh 没有 tty 输密码且会无限
+  重试，所以没配公钥时 spod 直接跳过隧道并提示，不会拿失败登录去撞锁号阈值。
+- `spod vpn` 和 `spod rider` 只对 SuperPod 有意义（VPN 是共用的，rider 借的是
+  别人的 SuperPod 隧道）。
 
 ## Quick Start
 

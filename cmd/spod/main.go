@@ -39,6 +39,98 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// ── Targets ──
+//
+// spod drives more than one HKUST cluster. A target bundles everything that is
+// per-cluster — ssh alias, .env key names, /tmp file tag, systemd unit — so
+// `spod` (SuperPod) and `spod hpc4` can be used at the same time without
+// touching each other's tunnel, relay, lock files, UID cache or ssh config
+// block. Anything shared (the VPN itself, the local Clash port) stays global.
+type target struct {
+	key       string // subcommand name: "superpod" / "hpc4"
+	label     string // display name in messages
+	alias     string // ~/.ssh/config Host alias (resolved in init from env)
+	aliasEnv  string // .env key overriding the alias
+	defAlias  string // fallback alias
+	userEnv   string // .env key holding the login name
+	hostEnv   string // .env key holding the hostname
+	defHost   string // fallback hostname
+	proxyEnv  string // .env key holding an optional SOCKS proxy (rider mode)
+	tunnelEnv string // .env key pinning the remote reverse-tunnel port
+	relayEnv  string // .env key pinning the remote relay port
+	socksEnv  string // .env key holding the local SOCKS5 listen port
+	defSocks  string // fallback SOCKS5 port — must differ per target
+	unit      string // systemd --user unit that may already own the tunnel
+	tag       string // /tmp filename suffix; "" keeps SuperPod's legacy paths
+}
+
+var targets = map[string]*target{
+	"superpod": {
+		key: "superpod", label: "SuperPod",
+		aliasEnv: "SPOD_SSH_HOST", defAlias: "superpod",
+		userEnv: "SUPERPOD_USER", hostEnv: "SUPERPOD_HOST", defHost: "superpod.ust.hk",
+		proxyEnv:  "SUPERPOD_SSH_PROXY",
+		tunnelEnv: "TUNNEL_PORT", relayEnv: "SPOD_RELAY_PORT",
+		socksEnv: "SOCKS_PORT", defSocks: "1080",
+		unit: "spod-tunnel.service", tag: "",
+	},
+	"hpc4": {
+		key: "hpc4", label: "HPC4",
+		aliasEnv: "HPC4_SSH_HOST", defAlias: "hpc4",
+		userEnv: "HPC4_USER", hostEnv: "HPC4_HOST", defHost: "hpc4.ust.hk",
+		proxyEnv:  "HPC4_SSH_PROXY",
+		tunnelEnv: "HPC4_TUNNEL_PORT", relayEnv: "HPC4_RELAY_PORT",
+		socksEnv: "HPC4_SOCKS_PORT", defSocks: "1081",
+		unit: "spod-tunnel-hpc4.service", tag: "-hpc4",
+	},
+}
+
+// tgt is the cluster the current invocation talks to. `spod hpc4 ...` flips it
+// before anything else runs (see useTarget).
+var tgt = targets["superpod"]
+
+func (t *target) user() string     { return envOr(t.userEnv, "") }
+func (t *target) hostname() string { return envOr(t.hostEnv, t.defHost) }
+func (t *target) proxy() string    { return envOr(t.proxyEnv, "") }
+
+// spodCmd is how the user re-invokes spod for THIS cluster ("spod" /
+// "spod hpc4"), so hint messages stay copy-pasteable on either one.
+func spodCmd() string {
+	if tgt.key == "superpod" {
+		return "spod"
+	}
+	return "spod " + tgt.key
+}
+
+// tmp returns a per-target path under /tmp. SuperPod keeps its historical
+// names (tag "") so an already-running tunnel/socks from an older binary is
+// still found; HPC4 gets its own set.
+func (t *target) tmp(base string) string {
+	return filepath.Join(os.TempDir(), "spod"+t.tag+"-"+base)
+}
+
+// useTarget repoints every per-cluster global at another cluster. Called once,
+// early, from dispatch() — before ports, tunnel or ssh touch anything.
+func useTarget(key string) {
+	t, exists := targets[key]
+	if !exists {
+		fail(fmt.Sprintf("未知集群: %s", key))
+		os.Exit(1)
+	}
+	if t.user() == "" {
+		fail(fmt.Sprintf("%s 未配置：在 .env 里设 %s=<登录名>", t.label, t.userEnv))
+		info(fmt.Sprintf("可选：%s=<主机名，默认 %s>", t.hostEnv, t.defHost))
+		os.Exit(1)
+	}
+	tgt = t
+	host = t.alias
+	tunnelPort = os.Getenv(t.tunnelEnv)
+	relayPort = os.Getenv(t.relayEnv)
+	socksPort = envOr(t.socksEnv, t.defSocks)
+	remoteUID = 0     // UID is per-cluster; drop SuperPod's cached value
+	ensureSSHConfig() // the alias block may not exist yet
+}
+
 func init() {
 	// Load .env from project root (walk up from executable or cwd)
 	for _, base := range []string{os.Getenv("SPOD_ENV_FILE"), findDotenv()} {
@@ -83,6 +175,14 @@ func init() {
 		break
 	}
 
+	// Resolve each cluster's ssh alias now that .env is loaded, and re-derive
+	// the active target's globals from it.
+	for _, t := range targets {
+		t.alias = envOr(t.aliasEnv, t.defAlias)
+	}
+	host = tgt.alias
+	socksPort = envOr(tgt.socksEnv, tgt.defSocks)
+
 	// Resolve VPN script path
 	vpnScript = envOr("VPN_SCRIPT", "")
 	if vpnScript == "" {
@@ -110,13 +210,10 @@ func init() {
 	ensureSSHConfig()
 }
 
+// ensureSSHConfig syncs one ~/.ssh/config block per configured cluster, so
+// `ssh superpod` and `ssh hpc4` both work and stay in step with .env. A cluster
+// with no user configured is skipped (its block, if any, is left alone).
 func ensureSSHConfig() {
-	sshUser := envOr("SUPERPOD_USER", "")
-	sshHost := envOr("SUPERPOD_HOST", "superpod.ust.hk")
-	if sshUser == "" {
-		return
-	}
-
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
@@ -124,16 +221,37 @@ func ensureSSHConfig() {
 	sshDir := filepath.Join(home, ".ssh")
 	configPath := filepath.Join(sshDir, "config")
 
-	// Optional: route SSH to SuperPod through another machine's shared VPN via
-	// its SOCKS5 proxy (a rider borrowing the provider's `spod socks`). Pair
-	// with SUPERPOD_HOST=<SuperPod internal IP> to dodge hairpin NAT on the VIP.
-	proxyLine := ""
-	if p := envOr("SUPERPOD_SSH_PROXY", ""); p != "" {
-		proxyLine = fmt.Sprintf("\n    ProxyCommand nc -X 5 -x %s %%h %%p", p)
+	existing, _ := os.ReadFile(configPath)
+	content := string(existing)
+	updated := content
+
+	// Deterministic order: the map iterates randomly, and a stable order keeps
+	// the file from being rewritten (block-swapped) on every run.
+	for _, key := range []string{"superpod", "hpc4"} {
+		t := targets[key]
+		if t.user() == "" {
+			continue
+		}
+		updated = upsertSSHBlock(updated, t.alias, sshBlockFor(t))
 	}
 
-	// Desired config block
-	desired := fmt.Sprintf(`Host superpod
+	if updated == content {
+		return // already correct
+	}
+	os.MkdirAll(sshDir, 0700)
+	os.WriteFile(configPath, []byte(updated), 0600)
+}
+
+// sshBlockFor renders the ~/.ssh/config block for one cluster.
+func sshBlockFor(t *target) string {
+	// Optional: route SSH through another machine's shared VPN via its SOCKS5
+	// proxy (a rider borrowing the provider's `spod socks`). Pair with
+	// <CLUSTER>_HOST=<internal IP> to dodge hairpin NAT on the public VIP.
+	proxyLine := ""
+	if p := t.proxy(); p != "" {
+		proxyLine = fmt.Sprintf("\n    ProxyCommand nc -X 5 -x %s %%h %%p", p)
+	}
+	return fmt.Sprintf(`Host %s
     HostName %s
     User %s%s
 
@@ -145,58 +263,58 @@ func ensureSSHConfig() {
     # 心跳：每 15s 发一次，连续 4 次无响应才断（容忍 60s 网络抖动）
     ServerAliveInterval 15
     ServerAliveCountMax 4
-    TCPKeepAlive yes`, sshHost, sshUser, proxyLine)
+    TCPKeepAlive yes
 
-	// Read existing config
-	existing, _ := os.ReadFile(configPath)
-	content := string(existing)
+    # 首次连接自动记住主机密钥：交互式提示会挂住后台的 ssh/autossh
+    StrictHostKeyChecking accept-new`, t.alias, t.hostname(), t.user(), proxyLine)
+}
 
-	// Check if superpod block exists and is up to date
-	if strings.Contains(content, "Host superpod") {
-		// Exact-match idempotency: a loose check (just ControlMaster+User) would
-		// wrongly treat a stale block as correct and never add/update the
-		// ProxyCommand when SUPERPOD_SSH_PROXY changes.
-		if strings.Contains(content, desired) {
-			return // already correct
-		}
-		// Config outdated — replace the whole superpod block
-		// Find block boundaries (from "Host superpod" to next "Host " or EOF)
-		lines := strings.Split(content, "\n")
-		var result []string
-		inBlock := false
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "Host superpod" {
-				inBlock = true
-				continue
-			}
-			if inBlock && strings.HasPrefix(trimmed, "Host ") {
-				inBlock = false
-			}
-			if inBlock {
-				continue
-			}
-			result = append(result, line)
-		}
-		// Remove leading/trailing blank lines and append new block
-		cleaned := strings.TrimSpace(strings.Join(result, "\n"))
-		if cleaned != "" {
-			cleaned += "\n\n"
-		}
-		content = cleaned + desired + "\n"
-	} else {
-		// No superpod block — append
+// upsertSSHBlock replaces the `Host <alias>` block in content with desired,
+// appending it when absent. Returns content unchanged when it already holds
+// exactly this block.
+//
+// Exact-match idempotency: a loose check (just ControlMaster+User) would
+// wrongly treat a stale block as correct and never add/update the ProxyCommand
+// when <CLUSTER>_SSH_PROXY changes.
+func upsertSSHBlock(content, alias, desired string) string {
+	header := "Host " + alias
+	if strings.Contains(content, desired) {
+		return content
+	}
+	if !strings.Contains(content, header) {
+		// No block for this alias — append
 		if content != "" && !strings.HasSuffix(content, "\n") {
 			content += "\n"
 		}
 		if content != "" {
 			content += "\n"
 		}
-		content += desired + "\n"
+		return content + desired + "\n"
 	}
-
-	os.MkdirAll(sshDir, 0700)
-	os.WriteFile(configPath, []byte(content), 0600)
+	// Block outdated — drop it (from "Host <alias>" to the next "Host " or EOF)
+	// and re-append the fresh one.
+	lines := strings.Split(content, "\n")
+	var result []string
+	inBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == header {
+			inBlock = true
+			continue
+		}
+		if inBlock && strings.HasPrefix(trimmed, "Host ") {
+			inBlock = false
+		}
+		if inBlock {
+			continue
+		}
+		result = append(result, line)
+	}
+	cleaned := strings.TrimSpace(strings.Join(result, "\n"))
+	if cleaned != "" {
+		cleaned += "\n\n"
+	}
+	return cleaned + desired + "\n"
 }
 
 func findDotenv() string {
@@ -260,6 +378,36 @@ func isSSHConnErr(err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 255
 }
 
+// isFatalSSHErr reports whether ssh failed for a reason retrying cannot fix.
+// It exits 255 for these just as it does for a reset connection, but:
+//   - a rejected login must not be repeated — HKUST locks the ITSC account
+//     after enough failed attempts, which would take the VPN down with it;
+//   - a host-key mismatch will fail identically every time, and three rounds
+//     of backoff only bury the one line that says what to do about it.
+func isFatalSSHErr(stderr string) bool {
+	for _, m := range []string{
+		"Permission denied",
+		"Too many authentication failures",
+		"No supported authentication methods",
+		"Host key verification failed",
+		"REMOTE HOST IDENTIFICATION HAS CHANGED",
+	} {
+		if strings.Contains(stderr, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// sshAuthOK reports whether we can log in without a password prompt.
+// Used as a gate before spawning autossh: autossh has no tty and retries
+// forever, so pointing it at an account we can't key into produces an endless
+// stream of failed logins.
+func sshAuthOK() bool {
+	err := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "true").Run()
+	return err == nil
+}
+
 func ssh(args ...string) (string, error) {
 	const maxRetries = 3
 	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
@@ -270,11 +418,14 @@ func ssh(args ...string) (string, error) {
 
 	for attempt := 0; ; attempt++ {
 		var cmd *exec.Cmd
+		// BatchMode: this helper runs unattended, so a password prompt would
+		// either hang it on /dev/tty or spend login attempts nobody is watching.
+		// Interactive sessions (sshInteractive) still allow passwords.
 		if useStdin {
-			cmd = exec.Command("ssh", "-o", "ConnectTimeout=5", host, "bash -s")
+			cmd = exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "bash -s")
 			cmd.Stdin = strings.NewReader(args[0])
 		} else {
-			cmd = exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+			cmd = exec.Command("ssh", append([]string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host}, args...)...)
 		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -283,7 +434,7 @@ func ssh(args ...string) (string, error) {
 		if err == nil {
 			return strings.TrimSpace(stdout.String()), nil
 		}
-		if isSSHConnErr(err) && attempt < maxRetries {
+		if isSSHConnErr(err) && !isFatalSSHErr(stderr.String()) && attempt < maxRetries {
 			warn(fmt.Sprintf("SSH 连接被重置，%v 后重试 (%d/%d)...", delays[attempt], attempt+1, maxRetries))
 			time.Sleep(delays[attempt])
 			continue
@@ -323,9 +474,16 @@ func sshInteractive(args ...string) error {
 func tunnelPIDAndPort() (int, string) {
 	// Word boundary after the port prevents false match on a longer port
 	// that shares our port as prefix (e.g. 78970 vs 7897).
+	//
+	// The trailing ssh alias is what keeps clusters apart: every target's
+	// autossh forwards the SAME local Clash port, so a pattern ending at
+	// :7897 matches `spod hpc4`'s tunnel just as well as SuperPod's — and
+	// ensureTunnel would then "clean up" the other cluster's tunnel as a
+	// stale one on every run. autossh puts the alias last, after the -R.
 	quotedLocal := regexp.QuoteMeta(localPort)
-	pgrepPattern := `autossh.*-R [0-9]+:127\.0\.0\.1:` + quotedLocal + `([^0-9]|$)`
-	procRE := regexp.MustCompile(`-R (\d+):127\.0\.0\.1:` + quotedLocal + `(?:[^0-9]|$)`)
+	quotedHost := regexp.QuoteMeta(host)
+	pgrepPattern := `autossh.*-R [0-9]+:127\.0\.0\.1:` + quotedLocal + ` ` + quotedHost + `( |$)`
+	procRE := regexp.MustCompile(`-R (\d+):127\.0\.0\.1:` + quotedLocal + ` ` + quotedHost + `(?:\s|$)`)
 
 	cmd := exec.Command("pgrep", "-f", pgrepPattern)
 	var stdout bytes.Buffer
@@ -390,8 +548,8 @@ func uidCachePath() string {
 	if cacheDir == "" {
 		return ""
 	}
-	sshUser := envOr("SUPERPOD_USER", "")
-	sshHost := envOr("SUPERPOD_HOST", host)
+	sshUser := tgt.user()
+	sshHost := tgt.hostname()
 	key := sshHost
 	if sshUser != "" {
 		key = sshUser + "@" + sshHost
@@ -513,6 +671,10 @@ func probeRiderNode(node string) bool {
 // (SPOD_NO_VPN), probes the candidate login nodes for the one whose relay is live,
 // points the `superpod` ssh alias at it, then hands off to the normal connect path.
 func riderConnect(sessionArg string) {
+	if tgt.key != "superpod" {
+		fail("rider 模式只对 SuperPod 有意义（借用 provider 的 SuperPod 隧道）")
+		os.Exit(1)
+	}
 	// Rider has no local tun0 and must not build its own tunnel/socks — it adopts
 	// the provider's. SPOD_NO_VPN short-circuits ensureVPN(); we simply never call
 	// ensureTunnel()/ensureSocks() here.
@@ -565,12 +727,68 @@ func ensureVPN() {
 		return
 	}
 	if vpnTunnelUp() {
+		ensureRoute()
 		return
 	}
 	fail("VPN 未连接 — tun0 不存在")
 	info("运行 `spod vpn` 启动 VPN")
 	info("（借用他人 VPN 时用 SPOD_NO_VPN=1 跳过此检查）")
 	os.Exit(1)
+}
+
+// ensureRoute makes sure the active cluster's IP is routed into the VPN.
+//
+// The VPN is split-tunnel: vpn-slice installs a /32 via tun0 only for the hosts
+// named in VPN_HOSTS. A cluster that isn't in that list still RESOLVES fine
+// (143.89.x.x is public DNS), so it looks configured — but its packets leave
+// via eth0 and the TCP connect just hangs until timeout. That's the whole
+// failure mode for HPC4 on a VPN brought up for SuperPod only.
+//
+// The permanent fix is VPN_HOSTS (applied on the next `spod vpn restart`);
+// this adds the missing /32 in place so an already-running VPN doesn't have to
+// be restarted. Needs root: uses SUDO_PASSWORD from .env, else passwordless
+// sudo. Skipped for riders (no local tun0 of their own) and with SPOD_NO_ROUTE=1.
+func ensureRoute() {
+	if os.Getenv("SPOD_NO_ROUTE") == "1" || tgt.proxy() != "" {
+		return
+	}
+	for _, ip := range resolveTarget(tgt.hostname()) {
+		out, err := exec.Command("ip", "route", "get", ip).Output()
+		if err == nil && strings.Contains(string(out), " dev tun0") {
+			continue
+		}
+		cmd := exec.Command("sudo", "-S", "-p", "", "ip", "route", "replace", ip, "dev", "tun0", "scope", "link")
+		if pw := os.Getenv("SUDO_PASSWORD"); pw != "" {
+			cmd.Stdin = strings.NewReader(pw + "\n")
+		} else {
+			cmd = exec.Command("sudo", "-n", "ip", "route", "replace", ip, "dev", "tun0", "scope", "link")
+		}
+		if err := cmd.Run(); err != nil {
+			warn(fmt.Sprintf("%s (%s) 没有走 VPN 的路由，自动补路由失败: %v", tgt.label, ip, err))
+			info(fmt.Sprintf("手动修：sudo ip route replace %s dev tun0 scope link", ip))
+			info(fmt.Sprintf("或在 .env 的 VPN_HOSTS 里加上 %s 后 spod vpn restart", tgt.hostname()))
+			continue
+		}
+		ok(fmt.Sprintf("已补 %s 的 VPN 路由 (%s → tun0)", tgt.label, ip))
+	}
+}
+
+// resolveTarget returns the IPv4 addresses for a hostname (or the literal IP).
+func resolveTarget(hostname string) []string {
+	if net.ParseIP(hostname) != nil {
+		return []string{hostname}
+	}
+	addrs, err := net.LookupIP(hostname)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range addrs {
+		if v4 := a.To4(); v4 != nil {
+			out = append(out, v4.String())
+		}
+	}
+	return out
 }
 
 // tunnelManagedExternally reports whether a systemd user unit already owns the
@@ -583,14 +801,14 @@ func tunnelManagedExternally() bool {
 	if os.Getenv("SPOD_FORCE_TUNNEL") == "1" {
 		return false
 	}
-	out, _ := exec.Command("systemctl", "--user", "is-active", "spod-tunnel.service").Output()
+	out, _ := exec.Command("systemctl", "--user", "is-active", tgt.unit).Output()
 	return strings.TrimSpace(string(out)) == "active"
 }
 
 func ensureTunnel() {
 	ensureVPN()
 	// Lockfile to prevent concurrent tunnel starts
-	lockPath := filepath.Join(os.TempDir(), "spod-tunnel.lock")
+	lockPath := tgt.tmp("tunnel.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err == nil {
 		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
@@ -605,7 +823,7 @@ func ensureTunnel() {
 	ensurePorts()
 
 	if tunnelManagedExternally() {
-		ok("隧道由 systemd 守护 (spod-tunnel.service)，本机不自建")
+		ok(fmt.Sprintf("隧道由 systemd 守护 (%s)，本机不自建", tgt.unit))
 		return
 	}
 
@@ -659,13 +877,19 @@ func ensureTunnel() {
 	// already up and reachable as a proxy, adopt it instead of racing.
 	// SPOD_FORCE_TUNNEL=1 skips adoption (designated provider override).
 	if os.Getenv("SPOD_FORCE_TUNNEL") != "1" && remoteTunnelHealthy() {
-		ok(fmt.Sprintf("复用隧道 (SuperPod:%s 已由同账号另一台机器提供，本机不自建)", tunnelPort))
+		ok(fmt.Sprintf("复用隧道 (%s:%s 已由同账号另一台机器提供，本机不自建)", tgt.label, tunnelPort))
 		return
 	}
 
-	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
+	if !sshAuthOK() {
+		warn(fmt.Sprintf("%s 免密登录不可用，跳过隧道", tgt.label))
+		info(fmt.Sprintf("autossh 没有 tty 输密码，会一直重试到锁账号；先装公钥：ssh-copy-id %s", host))
+		return
+	}
 
-	logPath := filepath.Join(os.TempDir(), "spod-tunnel.log")
+	info(fmt.Sprintf("启动隧道 (%s:%s → 本地:%s)...", tgt.label, tunnelPort, localPort))
+
+	logPath := tgt.tmp("tunnel.log")
 	// Truncate on each new autossh start: the prior autossh (if any) was
 	// already killed in the loop above, and append-mode would otherwise
 	// grow without bound across reconnect storms.
@@ -790,7 +1014,7 @@ func socksPID() int {
 
 func ensureSocks() {
 	ensureVPN()
-	lockPath := filepath.Join(os.TempDir(), "spod-socks.lock")
+	lockPath := tgt.tmp("socks.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err == nil {
 		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
@@ -819,7 +1043,13 @@ func ensureSocks() {
 		return
 	}
 
-	info(fmt.Sprintf("启动 SOCKS5 代理 (0.0.0.0:%s → SuperPod)...", socksPort))
+	if !sshAuthOK() {
+		fail(fmt.Sprintf("%s 免密登录不可用，不启动 SOCKS（autossh 会一直重试到锁账号）", tgt.label))
+		info(fmt.Sprintf("先装公钥：ssh-copy-id %s", host))
+		os.Exit(1)
+	}
+
+	info(fmt.Sprintf("启动 SOCKS5 代理 (0.0.0.0:%s → %s)...", socksPort, tgt.label))
 
 	logPath := filepath.Join(os.TempDir(), "spod-socks.log")
 	// Truncate on each new autossh start (mirrors ensureTunnel rationale).
@@ -895,14 +1125,23 @@ func socksStatus() {
 		// Check if port is actually listening
 		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+socksPort, 2*time.Second)
 		if err != nil {
-			warn("端口未监听 — 进程可能卡住，尝试 `spod socks stop` 后重启")
+			warn(fmt.Sprintf("端口未监听 — 进程可能卡住，尝试 `%s socks stop` 后重启", spodCmd()))
 		} else {
 			conn.Close()
 			ok("端口监听正常")
 		}
-	} else {
-		warn("SOCKS5 代理未运行")
+		return
 	}
+	// No autossh of ours — but the proxy may be externally managed (the systemd
+	// unit runs plain `ssh -D`, which socksPID() cannot see). ensureSocks
+	// already probes the port for exactly this reason; report the same truth
+	// here instead of claiming the proxy is down while it is serving traffic.
+	if conn, err := net.DialTimeout("tcp", "127.0.0.1:"+socksPort, 2*time.Second); err == nil {
+		conn.Close()
+		ok(fmt.Sprintf("SOCKS5 代理运行中 (0.0.0.0:%s 已监听，外部托管)", socksPort))
+		return
+	}
+	warn("SOCKS5 代理未运行")
 }
 
 // ── VS Code (Windows Remote-SSH) ──
@@ -1006,11 +1245,11 @@ func cmdVscode() {
 	winSSHDir := filepath.Join("/mnt/c/Users", winUser, ".ssh")
 	winConfigPath := filepath.Join(winSSHDir, "config")
 
-	// 3. Get SuperPod internal IP
-	info("查询 SuperPod 内网 IP...")
+	// 3. Get the cluster's internal IP
+	info(fmt.Sprintf("查询 %s 内网 IP...", tgt.label))
 	internalIP, err := ssh("hostname -I | awk '{print $1}'")
 	if err != nil || internalIP == "" {
-		fail(fmt.Sprintf("无法获取 SuperPod 内网 IP: %v", err))
+		fail(fmt.Sprintf("无法获取 %s 内网 IP: %v", tgt.label, err))
 		os.Exit(1)
 	}
 	ok(fmt.Sprintf("内网 IP: %s", internalIP))
@@ -1023,8 +1262,8 @@ func cmdVscode() {
 		os.Exit(1)
 	}
 
-	// 5. Ensure Windows SSH key exists and is authorized on SuperPod
-	sshUser := envOr("SUPERPOD_USER", "")
+	// 5. Ensure Windows SSH key exists and is authorized on the cluster
+	sshUser := tgt.user()
 	winPubKeyPath := filepath.Join(winSSHDir, "id_ed25519.pub")
 	if _, err := os.Stat(winPubKeyPath); err != nil {
 		// Try RSA
@@ -1035,7 +1274,7 @@ func cmdVscode() {
 		// Check if already authorized
 		out, _ := ssh("grep -cF '" + strings.Split(key, " ")[1] + "' ~/.ssh/authorized_keys 2>/dev/null")
 		if out == "0" || out == "" {
-			info("添加 Windows SSH 公钥到 SuperPod...")
+			info(fmt.Sprintf("添加 Windows SSH 公钥到 %s...", tgt.label))
 			if _, err := ssh("mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '" + key + "' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"); err != nil {
 				warn(fmt.Sprintf("公钥添加失败: %v（可能需要手动添加）", err))
 			} else {
@@ -1050,26 +1289,26 @@ func cmdVscode() {
 	}
 
 	// 6. Write/update Windows SSH config
-	desired := fmt.Sprintf(`Host superpod
+	desired := fmt.Sprintf(`Host %s
     HostName %s
     User %s
     ProxyCommand "%s" -S 127.0.0.1:%s %%h %%p
     ServerAliveInterval 15
-    ServerAliveCountMax 4`, internalIP, sshUser, connectExe, socksPort)
+    ServerAliveCountMax 4`, tgt.alias, internalIP, sshUser, connectExe, socksPort)
 
 	os.MkdirAll(winSSHDir, 0700)
 	existing, _ := os.ReadFile(winConfigPath)
 	content := string(existing)
 
-	if strings.Contains(content, "Host superpod") {
+	if strings.Contains(content, "Host "+tgt.alias) {
 		// Replace existing block
 		lines := strings.Split(content, "\n")
 		var result []string
 		inBlock := false
 		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
-			if trimmed == "Host superpod" || strings.HasPrefix(trimmed, "Host superpod ") ||
-				trimmed == "Host superpod.ust.hk superpod" {
+			if trimmed == "Host "+tgt.alias || strings.HasPrefix(trimmed, "Host "+tgt.alias+" ") ||
+				trimmed == "Host "+tgt.hostname()+" "+tgt.alias {
 				inBlock = true
 				continue
 			}
@@ -1108,8 +1347,8 @@ func cmdVscode() {
 	fmt.Println()
 	info("VS Code 连接方式:")
 	info("  1. 安装 Remote-SSH 扩展")
-	info("  2. Ctrl+Shift+P → Remote-SSH: Connect to Host → superpod")
-	info(fmt.Sprintf("  （确保 WSL 中 SOCKS 代理运行: spod socks）"))
+	info(fmt.Sprintf("  2. Ctrl+Shift+P → Remote-SSH: Connect to Host → %s", tgt.alias))
+	info(fmt.Sprintf("  （确保 WSL 中 SOCKS 代理运行: %s socks）", spodCmd()))
 }
 
 // ── VPN ──
@@ -1149,7 +1388,7 @@ func vpnIsUp() bool {
 	if !vpnTunnelUp() {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", 5*time.Second)
+	conn, err := net.DialTimeout("tcp", tgt.hostname()+":22", 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -1313,17 +1552,44 @@ func cmdVpnStatus() {
 	} else {
 		warn("VPN 进程未运行")
 	}
-	if vpnIsUp() {
-		ok(fmt.Sprintf("SuperPod 可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
-	} else {
-		fail(fmt.Sprintf("SuperPod 不可达 (%s:22)", envOr("SUPERPOD_HOST", "superpod.ust.hk")))
+	// Report every configured cluster: they share one VPN but need separate
+	// split-tunnel routes, so one can be reachable while the other is not.
+	up := vpnTunnelUp()
+	for _, key := range []string{"superpod", "hpc4"} {
+		t := targets[key]
+		if t.user() == "" {
+			continue
+		}
+		addr := t.hostname() + ":22"
+		if !up {
+			fail(fmt.Sprintf("%s 不可达 (%s) — tun0 不存在", t.label, addr))
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			fail(fmt.Sprintf("%s 不可达 (%s)", t.label, addr))
+			for _, ip := range resolveTarget(t.hostname()) {
+				out, _ := exec.Command("ip", "route", "get", ip).Output()
+				if !strings.Contains(string(out), " dev tun0") {
+					info(fmt.Sprintf("  %s 没走 VPN 路由 — 在 .env 的 VPN_HOSTS 里加上 %s 后 spod vpn restart", ip, t.hostname()))
+				}
+			}
+			continue
+		}
+		conn.Close()
+		ok(fmt.Sprintf("%s 可达 (%s)", t.label, addr))
 	}
 }
 
 func cmdVpnWidget() {
 	// Compact one-line status for shell prompt / tmux
 	// --color flag enables ANSI colors
-	color := len(os.Args) > 3 && os.Args[3] == "--color"
+	color := false
+	for _, a := range os.Args[1:] {
+		if a == "--color" {
+			color = true
+		}
+	}
 	pid := vpnPID()
 	if pid > 0 && vpnTunnelUp() {
 		if color {
@@ -1542,19 +1808,18 @@ const spodSyncTag = "spod-sync" // marker for pkill
 
 func cmdSync(remotePath, localPath string) {
 	if remotePath == "" || localPath == "" {
-		fail("用法: spod sync <remote_path> <local_path>")
-		info("示例: spod sync /project/data/train ./data/")
-		info("示例: spod sync /home/user/results /mnt/e/results/")
+		fail(fmt.Sprintf("用法: %s sync <remote_path> <local_path>", spodCmd()))
+		info(fmt.Sprintf("示例: %s sync /project/data/train ./data/", spodCmd()))
+		info(fmt.Sprintf("示例: %s sync /home/user/results /mnt/e/results/", spodCmd()))
 		os.Exit(1)
 	}
 
-	sshUser := envOr("SUPERPOD_USER", "")
+	sshUser := tgt.user()
 	if sshUser == "" {
-		fail("需要设置 SUPERPOD_USER（在 .env 或环境变量中）")
+		fail(fmt.Sprintf("需要设置 %s（在 .env 或环境变量中）", tgt.userEnv))
 		os.Exit(1)
 	}
-	superpodHost := envOr("SUPERPOD_HOST", "superpod.ust.hk")
-	src := sshUser + "@" + superpodHost + ":" + remotePath
+	src := sshUser + "@" + tgt.hostname() + ":" + remotePath
 	dst := localPath
 
 	// Ensure local dir exists
@@ -1601,16 +1866,23 @@ func cmdSync(remotePath, localPath string) {
 
 	time.Sleep(3 * time.Second)
 
-	out, _ := exec.Command("bash", "-c", "pgrep -fc 'rsync.*-rlP' || echo 0").CombinedOutput()
+	out, _ := exec.Command("bash", "-c", "pgrep -fc '"+syncPattern()+"' || echo 0").CombinedOutput()
 	count := strings.TrimSpace(string(out))
 	ok(fmt.Sprintf("%s 路 rsync 运行中", count))
 	info(fmt.Sprintf("查看进度: du -sh %s", dst))
-	info("停止所有: spod sync stop")
+	info(fmt.Sprintf("停止所有: %s sync stop", spodCmd()))
 }
 
 func cmdSyncStop() {
-	exec.Command("pkill", "-f", "rsync.*-rlP").Run()
-	ok("已停止所有 rsync")
+	exec.Command("pkill", "-f", syncPattern()).Run()
+	ok(fmt.Sprintf("已停止所有 %s 的 rsync", tgt.label))
+}
+
+// syncPattern matches only THIS cluster's rsync jobs. The remote host appears
+// in every job's argv (user@host:path), so scoping by it keeps `spod sync stop`
+// from killing a transfer running against the other cluster.
+func syncPattern() string {
+	return "rsync.*-rlP.*" + regexp.QuoteMeta(tgt.hostname())
 }
 
 // ── Get (pull individual files) ──
@@ -2060,7 +2332,7 @@ func cmdGet(args []string) {
 	}
 
 	if len(remotes) == 0 {
-		fail("用法: spod get <远程路径>... [-o <本地目录>]")
+		fail(fmt.Sprintf("用法: %s get <远程路径>... [-o <本地目录>]", spodCmd()))
 		info(`示例: spod get /project/foo/a.mp4`)
 		info(`示例: spod get '/project/foo/*.mp4' -o .`)
 		info(`示例: spod get /project/foo/a.mp4 -o 'C:\Users\Win11\Desktop'`)
@@ -2342,7 +2614,7 @@ func fullName(name string) string {
 }
 
 func printSessions(sessions []session) {
-	fmt.Fprintf(os.Stderr, "\n  %s%sSuperPod Sessions%s\n", bold, cPurple, reset)
+	fmt.Fprintf(os.Stderr, "\n  %s%s%s Sessions%s\n", bold, cPurple, tgt.label, reset)
 	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
 	for i, s := range sessions {
 		var icon, status string
@@ -2591,7 +2863,11 @@ func ensureRemoteCLIs() {
 	if os.Getenv("SPOD_NO_CLI_CHECK") == "1" {
 		return
 	}
+	// No conda env at all → this cluster was never set up for claude/codex
+	// (HPC4, a fresh account). Stay silent instead of warning "can't auto-fix"
+	// on every connect; the tunnel and tmux session still work.
 	probe := `ENV_BIN="$HOME/.conda/envs/claude/bin"
+[ -d "$ENV_BIN" ] || { echo "NOENV"; exit 0; }
 broken=""
 for name in claude codex; do
     link="$ENV_BIN/$name"
@@ -2609,6 +2885,9 @@ echo "BROKEN:${broken# }"
 		warn("远端 claude/codex 健康检查失败（跳过）")
 		return
 	}
+	if strings.TrimSpace(out) == "NOENV" {
+		return
+	}
 	var brokenLine, npmPath string
 	for _, line := range strings.Split(out, "\n") {
 		switch {
@@ -2623,7 +2902,7 @@ echo "BROKEN:${broken# }"
 	}
 	if npmPath == "" {
 		warn(fmt.Sprintf("远端 %s 损坏（symlink 目标缺失），但 conda env 'claude' 里没找到 npm，无法自动修复", brokenLine))
-		warn("手动修复: ssh superpod 后激活 claude env，运行 npm install -g @anthropic-ai/claude-code @openai/codex")
+		warn(fmt.Sprintf("手动修复: ssh %s 后激活 claude env，运行 npm install -g @anthropic-ai/claude-code @openai/codex", host))
 		return
 	}
 	pkgs := []string{}
@@ -2703,7 +2982,7 @@ func cmdNew(name string) {
 
 func cmdKill(name string) {
 	if name == "" {
-		fail("用法: spod kill <name>")
+		fail(fmt.Sprintf("用法: %s kill <name>", spodCmd()))
 		os.Exit(1)
 	}
 	name = fullName(name)
@@ -2813,7 +3092,7 @@ func cmdCreds() {
 		warn("没有找到本地凭证文件")
 		info("先在本地运行 `codex login` 或 `claude login`")
 	} else {
-		ok(fmt.Sprintf("已同步 %d 个凭证文件到 SuperPod", synced))
+		ok(fmt.Sprintf("已同步 %d 个凭证文件到 %s", synced, tgt.label))
 	}
 }
 
@@ -2903,15 +3182,36 @@ func cmdHelp() {
 		{"spod rider", "借用 provider 的 SOCKS，自动连到 relay 活的登录节点"},
 		{"spod creds", "同步本地凭证到 SuperPod"},
 		{"spod uptime", "查看 login 节点启动时间和负载"},
+		{"spod hpc4 <子命令>", "同样的命令，但走 HPC4（隧道/relay/端口全独立）"},
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
+	}
+	fmt.Fprintf(os.Stderr, "\n  %sHPC4%s\n", bold, reset)
+	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
+	for _, l := range []string{
+		"上面除 vpn/rider 外的子命令都能加 hpc4 前缀，两个集群可同时用：",
+		"  spod              spod hpc4            两套 tmux 会话",
+		"  spod get ...      spod hpc4 get ...    两套隧道/relay/SOCKS 端口",
+		".env 需要 HPC4_USER；VPN_HOSTS 要包含 hpc4.ust.hk（否则没有 VPN 路由）。",
+	} {
+		fmt.Fprintf(os.Stderr, "    %s%s%s\n", cGray, l, reset)
 	}
 	fmt.Fprintln(os.Stderr)
 }
 
 func main() {
-	args := os.Args[1:]
+	dispatch(os.Args[1:])
+}
+
+// dispatch runs one spod command. A leading cluster name ("hpc4") repoints
+// every per-cluster global and re-enters with the remaining arguments, so each
+// subcommand works against either cluster without a duplicated switch — and
+// `spod` and `spod hpc4` can run side by side.
+//
+// Cost of that shape: a cluster name can no longer be a tmux session name.
+// `spod hpc4` means the cluster, not a session called "hpc4".
+func dispatch(args []string) {
 	cmd := ""
 	if len(args) > 0 {
 		cmd = args[0]
@@ -2920,6 +3220,9 @@ func main() {
 	switch cmd {
 	case "-h", "--help", "help":
 		cmdHelp()
+	case "hpc4", "superpod":
+		useTarget(cmd)
+		dispatch(args[1:])
 	case "vpn":
 		sub := ""
 		if len(args) > 1 {
