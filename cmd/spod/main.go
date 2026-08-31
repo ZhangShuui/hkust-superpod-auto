@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -1669,25 +1671,9 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", total/60, total%60)
 }
 
-// localBytes sums what has landed in dest so far. --append-verify writes
-// straight to the destination filename, but fall back to rsync's `.name.XXXXXX`
-// temp file so the bar still moves if that ever changes.
-func localBytes(dest string, names []string) int64 {
-	var total int64
-	for _, n := range names {
-		if fi, err := os.Stat(filepath.Join(dest, n)); err == nil {
-			total += fi.Size()
-			continue
-		}
-		matches, _ := filepath.Glob(filepath.Join(dest, "."+n+".*"))
-		for _, m := range matches {
-			if fi, err := os.Stat(m); err == nil {
-				total += fi.Size()
-			}
-		}
-	}
-	return total
-}
+// (progress is driven by a byte counter the fetchers bump — see parallelFetch.
+// Polling file sizes would not work: destination files are preallocated to
+// their full length so workers can pwrite chunks at absolute offsets.)
 
 // renderBar draws a single-line progress bar on stderr, overwriting in place.
 func renderBar(done, total int64, rate float64, label string) {
@@ -1718,9 +1704,10 @@ func renderBar(done, total int64, rate float64, label string) {
 	fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
 }
 
-// progressBar polls dest until stop is closed, drawing a bar. Speed is measured
-// over a trailing window so a stalled or bursty link doesn't swing the ETA.
-func progressBar(dest string, names []string, total int64, stop <-chan struct{}, done chan<- struct{}) {
+// progressBar samples `sample` until stop is closed, drawing a bar. Speed is
+// measured over a trailing window so a stalled or bursty link doesn't swing the
+// ETA. `label` is re-evaluated every tick for the trailing annotation.
+func progressBar(sample func() int64, total int64, label func() string, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	if !stderrIsTTY() {
 		return
@@ -1728,20 +1715,18 @@ func progressBar(dest string, names []string, total int64, stop <-chan struct{},
 	const tick = 500 * time.Millisecond
 	const window = 10 // samples → 5s trailing window
 
-	start := localBytes(dest, names)
-	samples := []int64{start}
+	samples := []int64{sample()}
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-stop:
-			cur := localBytes(dest, names)
-			renderBar(cur, total, 0, "")
+			renderBar(sample(), total, 0, "")
 			fmt.Fprint(os.Stderr, "\r\033[K")
 			return
 		case <-ticker.C:
-			cur := localBytes(dest, names)
+			cur := sample()
 			samples = append(samples, cur)
 			if len(samples) > window+1 {
 				samples = samples[len(samples)-(window+1):]
@@ -1751,22 +1736,298 @@ func progressBar(dest string, names []string, total int64, stop <-chan struct{},
 				elapsed := time.Duration(n-1) * tick
 				rate = float64(samples[n-1]-samples[0]) / elapsed.Seconds()
 			}
-			label := ""
-			if len(names) > 1 {
-				fin := 0
-				for _, nm := range names {
-					if _, err := os.Stat(filepath.Join(dest, nm)); err == nil {
-						fin++
-					}
-				}
-				if fin > len(names) {
-					fin = len(names)
-				}
-				label = fmt.Sprintf("(%d/%d 文件)", fin, len(names))
+			lbl := ""
+			if label != nil {
+				lbl = label()
 			}
-			renderBar(cur, total, rate, label)
+			renderBar(cur, total, rate, lbl)
 		}
 	}
+}
+
+// shellQuote wraps s in single quotes for safe interpolation into a remote
+// shell command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// remoteFile is one file selected for download.
+type remoteFile struct {
+	path string // absolute path on SuperPod
+	base string // basename — also the local filename under dest
+	size int64
+}
+
+// fetchChunk is one contiguous byte range of one file.
+type fetchChunk struct {
+	rf  *remoteFile
+	idx int   // chunk index within the file
+	off int64 // absolute offset in the file
+	n   int64
+}
+
+// getState is the resume sidecar written next to each destination file.
+//
+// Chunks land at absolute offsets via pwrite, so a half-fetched file is already
+// full-length with holes in it — its size says nothing about what completed.
+// The sidecar is the only record of which ranges are done.
+type getState struct {
+	Size      int64 `json:"size"`
+	ChunkSize int64 `json:"chunk"`
+	Done      []int `json:"done"`
+}
+
+func statePathFor(dest, base string) string {
+	return filepath.Join(dest, "."+base+".spodget")
+}
+
+func loadGetState(p string) *getState {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var st getState
+	if json.Unmarshal(b, &st) != nil || st.Size <= 0 || st.ChunkSize <= 0 {
+		return nil
+	}
+	return &st
+}
+
+// fetchChunkSize aims for a few chunks per stream so a slow flow can't strand
+// the tail of a transfer, while keeping chunks big enough that per-chunk SSH
+// round-trips stay negligible.
+func fetchChunkSize(size int64, streams int) int64 {
+	const minChunk, maxChunk = 4 << 20, 64 << 20
+	target := size / int64(streams*4)
+	switch {
+	case target < minChunk:
+		return minChunk
+	case target > maxChunk:
+		return maxChunk
+	default:
+		return target
+	}
+}
+
+// getStreams is how many independent SSH connections a download fans out over.
+//
+// Each stream is its own TCP flow. That matters because the HKUST VPN carries
+// everything over a single TLS/TCP connection with no ESP datagram channel
+// (openconnect logs "Set up UDP failed; using SSL instead"), which puts the
+// inner RTT around 300ms and pins any *one* TCP flow near 255 KB/s regardless
+// of available bandwidth. Measured on that link: 1 flow 254 KB/s, 3 flows
+// 427 KB/s, 6 flows 695 KB/s. Beyond ~6 the gain flattens and login-rate
+// pressure on the shared account starts to matter.
+func getStreams() int {
+	if v := os.Getenv("SPOD_GET_STREAMS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 16 {
+			return n
+		}
+	}
+	return 4
+}
+
+// getSSHOpts builds the SSH options for one fetch worker.
+//
+// The per-worker ControlPath is the whole point: `Host superpod` in ~/.ssh/config
+// sets ControlMaster auto on a shared socket, so without this override every
+// "parallel" stream would be a channel on ONE multiplexed TCP connection and
+// share one congestion window — measured at 100 KB/s against 254 KB/s for a
+// dedicated connection. A private socket per worker gives each its own flow
+// while still reusing that connection across all of the worker's chunks, so a
+// large file costs `streams` logins rather than one per chunk.
+func getSSHOpts(worker int) []string {
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", fmt.Sprintf("ControlPath=/tmp/spod-get-%d-%d", os.Getpid(), worker),
+		"-o", "ControlPersist=30",
+		"-o", "ConnectTimeout=15",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
+	}
+}
+
+// chunkWriter pwrites a chunk's bytes at their absolute offset and reports
+// progress as they land. Concurrent WriteAt on one *os.File is safe — it is a
+// pwrite syscall and does not touch the shared file offset.
+type chunkWriter struct {
+	f       *os.File
+	off     int64
+	written int64
+	counter *atomic.Int64
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	n, err := w.f.WriteAt(p, w.off)
+	w.off += int64(n)
+	w.written += int64(n)
+	w.counter.Add(int64(n))
+	return n, err
+}
+
+// fetchOne pulls a single chunk, retrying on transport failure. A retry rolls
+// the progress counter back by what the failed attempt wrote, since the chunk
+// restarts from its beginning.
+func fetchOne(c fetchChunk, f *os.File, opts []string, counter *atomic.Int64) error {
+	const attempts = 3
+	var lastErr error
+	for a := 0; a < attempts; a++ {
+		if a > 0 {
+			time.Sleep(time.Duration(int64(2*time.Second) << uint(a-1)))
+		}
+		w := &chunkWriter{f: f, off: c.off, counter: counter}
+		dd := fmt.Sprintf("dd if=%s bs=1M iflag=skip_bytes,count_bytes skip=%d count=%d status=none",
+			shellQuote(c.rf.path), c.off, c.n)
+		cmd := exec.Command("ssh", append(append([]string{}, opts...), host, dd)...)
+		cmd.Stdout = w
+		var errBuf bytes.Buffer
+		cmd.Stderr = &errBuf
+		err := cmd.Run()
+
+		switch {
+		case err == nil && w.written == c.n:
+			return nil
+		case err == nil:
+			// Short read: the file shrank or was silly-renamed mid-transfer.
+			lastErr = fmt.Errorf("%s 偏移 %d 只收到 %d/%d 字节", c.rf.base, c.off, w.written, c.n)
+		default:
+			lastErr = err
+			if msg := strings.TrimSpace(errBuf.String()); msg != "" {
+				lastErr = fmt.Errorf("%w: %s", err, msg)
+			}
+		}
+		counter.Add(-w.written)
+	}
+	return lastErr
+}
+
+// parallelFetch downloads every file in files into dest over `streams`
+// independent SSH connections, resuming from any sidecar left by a previous
+// run. It returns a sampler for the progress bar via the counter it fills.
+func parallelFetch(files []*remoteFile, dest string, streams int, counter *atomic.Int64, doneFiles *atomic.Int64) error {
+	type fileCtx struct {
+		f         *os.File
+		statePath string
+		state     getState
+		remaining int
+	}
+
+	ctxs := map[*remoteFile]*fileCtx{}
+	closeAll := func() {
+		for _, c := range ctxs {
+			c.f.Close()
+		}
+	}
+
+	var chunks []fetchChunk
+	for _, rf := range files {
+		chunkSize := fetchChunkSize(rf.size, streams)
+		st := getState{Size: rf.size, ChunkSize: chunkSize}
+		// Adopt the previous run's chunk size so resume still lines up when
+		// SPOD_GET_STREAMS changed between runs.
+		if prev := loadGetState(statePathFor(dest, rf.base)); prev != nil && prev.Size == rf.size {
+			st = *prev
+		}
+		done := map[int]bool{}
+		for _, i := range st.Done {
+			done[i] = true
+		}
+
+		local := filepath.Join(dest, rf.base)
+		f, err := os.OpenFile(local, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("打开 %s: %w", local, err)
+		}
+		if err := f.Truncate(rf.size); err != nil {
+			f.Close()
+			closeAll()
+			return fmt.Errorf("预分配 %s: %w", local, err)
+		}
+
+		fc := &fileCtx{f: f, statePath: statePathFor(dest, rf.base), state: st}
+		ctxs[rf] = fc
+
+		for off, idx := int64(0), 0; off < rf.size; off, idx = off+st.ChunkSize, idx+1 {
+			n := st.ChunkSize
+			if rem := rf.size - off; rem < n {
+				n = rem
+			}
+			if done[idx] {
+				counter.Add(n)
+				continue
+			}
+			fc.remaining++
+			chunks = append(chunks, fetchChunk{rf: rf, idx: idx, off: off, n: n})
+		}
+		if fc.remaining == 0 {
+			doneFiles.Add(1)
+		}
+	}
+	defer closeAll()
+
+	if streams > len(chunks) {
+		streams = len(chunks)
+	}
+	if streams < 1 {
+		return nil
+	}
+
+	// A worker's SSH connection outlives its chunks; drop it explicitly rather
+	// than leaving ControlPersist sockets behind after the command exits.
+	defer func() {
+		for i := 0; i < streams; i++ {
+			exec.Command("ssh", append(append([]string{"-O", "exit"}, getSSHOpts(i)...), host)...).Run()
+		}
+	}()
+
+	var (
+		mu      sync.Mutex // guards fileCtx bookkeeping and sidecar writes
+		wg      sync.WaitGroup
+		next    atomic.Int64
+		errOnce sync.Once
+		fetchEr error
+		abort   = make(chan struct{})
+	)
+
+	for w := 0; w < streams; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			opts := getSSHOpts(worker)
+			for {
+				select {
+				case <-abort:
+					return
+				default:
+				}
+				i := int(next.Add(1)) - 1
+				if i >= len(chunks) {
+					return
+				}
+				c := chunks[i]
+				if err := fetchOne(c, ctxs[c.rf].f, opts, counter); err != nil {
+					errOnce.Do(func() { fetchEr = err; close(abort) })
+					return
+				}
+
+				mu.Lock()
+				fc := ctxs[c.rf]
+				fc.state.Done = append(fc.state.Done, c.idx)
+				fc.remaining--
+				if fc.remaining == 0 {
+					doneFiles.Add(1)
+					fc.f.Sync()
+					os.Remove(fc.statePath)
+				} else if b, err := json.Marshal(fc.state); err == nil {
+					os.WriteFile(fc.statePath, b, 0644)
+				}
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+	return fetchEr
 }
 
 // cmdGet pulls one or more remote files to a local directory, verifying each
@@ -1778,9 +2039,8 @@ func progressBar(dest string, names []string, total int64, stop <-chan struct{},
 // and there is nothing left to verify against afterwards. Grabbing the digest
 // up front means a completed transfer can always be proven intact.
 //
-// Transfers run as a single rsync stream on purpose. The VPN link saturates at
-// roughly one stream's worth of bandwidth; splitting into parallel streams
-// measurably *lowers* aggregate throughput, so there is nothing to win here.
+// Transfers fan out over several independent SSH connections — see getStreams
+// and getSSHOpts for why that is worth roughly 3x on this link.
 func cmdGet(args []string) {
 	// Parse: spod get <remote>... [-o <dest>]
 	var remotes []string
@@ -1830,8 +2090,9 @@ func cmdGet(args []string) {
 		fail(fmt.Sprintf("列出远程文件失败: %v", err))
 		os.Exit(1)
 	}
-	var files []string
+	var files []*remoteFile
 	var totalBytes int64
+	seen := map[string]string{} // basename → first path that claimed it
 	for _, l := range strings.Split(listing, "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -1842,7 +2103,17 @@ func cmdGet(args []string) {
 			continue
 		}
 		sz, _ := strconv.ParseInt(szStr, 10, 64)
-		files = append(files, path)
+		base := filepath.Base(path)
+		// Everything is flattened into dest, so two same-named files from
+		// different directories would race each other's chunks into one local
+		// file. Refuse rather than produce a corrupt download.
+		if first, dup := seen[base]; dup {
+			fail(fmt.Sprintf("文件名冲突: %s 与 %s 同名，都会写到 %s", first, path, filepath.Join(dest, base)))
+			info("分开下载，或用 -o 指定不同目录")
+			os.Exit(1)
+		}
+		seen[base] = path
+		files = append(files, &remoteFile{path: path, base: base, size: sz})
 		totalBytes += sz
 	}
 	if len(files) == 0 {
@@ -1850,7 +2121,7 @@ func cmdGet(args []string) {
 		os.Exit(1)
 	}
 	for _, f := range files {
-		info("  " + f)
+		info("  " + f.path)
 	}
 	info(fmt.Sprintf("共 %d 个文件, %s", len(files), humanBytes(totalBytes)))
 
@@ -1858,7 +2129,7 @@ func cmdGet(args []string) {
 	info(fmt.Sprintf("计算远端 MD5（%d 个文件）...", len(files)))
 	var shellList []string
 	for _, f := range files {
-		shellList = append(shellList, "'"+strings.ReplaceAll(f, "'", `'\''`)+"'")
+		shellList = append(shellList, shellQuote(f.path))
 	}
 	sums, err := ssh("md5sum " + strings.Join(shellList, " "))
 	want := map[string]string{} // basename → md5
@@ -1873,54 +2144,24 @@ func cmdGet(args []string) {
 		}
 	}
 
-	// rsync --files-from avoids all shell quoting on the remote side; paths in
-	// the list are relative to the remote root, and --no-relative flattens them
-	// into dest instead of recreating /project/... underneath it.
-	listFile, err := os.CreateTemp("", "spod-get-*.list")
-	if err != nil {
-		fail(fmt.Sprintf("创建临时文件失败: %v", err))
-		os.Exit(1)
-	}
-	defer os.Remove(listFile.Name())
-	for _, f := range files {
-		fmt.Fprintln(listFile, strings.TrimPrefix(f, "/"))
-	}
-	listFile.Close()
+	streams := getStreams()
+	info(fmt.Sprintf("下载到 %s（%d 路并行）...", dest, streams))
 
-	info(fmt.Sprintf("下载到 %s ...", dest))
-	rsyncArgs := []string{
-		"-rt", "--partial", "--append-verify", "--no-relative",
-		"--no-perms", "--no-owner", "--no-group", "--quiet",
-		"--files-from=" + listFile.Name(),
-		host + ":/", dest + "/",
-	}
-	rc := exec.Command("rsync", rsyncArgs...)
-	var rsyncErrBuf bytes.Buffer
-	rc.Stdout = os.Stdout
-	rc.Stderr = &rsyncErrBuf
-
-	// Own progress bar rather than rsync's --info=progress2: it reports totals
-	// across the whole file set the way we want, survives the multi-file case,
-	// and keeps the output on one line.
-	var basenames []string
-	for _, f := range files {
-		basenames = append(basenames, filepath.Base(f))
+	var fetched, doneFiles atomic.Int64
+	label := func() string {
+		if len(files) <= 1 {
+			return ""
+		}
+		return fmt.Sprintf("(%d/%d 文件)", doneFiles.Load(), len(files))
 	}
 	stop, barDone := make(chan struct{}), make(chan struct{})
-	if err := rc.Start(); err != nil {
-		fail(fmt.Sprintf("启动 rsync 失败: %v", err))
-		os.Exit(1)
-	}
-	go progressBar(dest, basenames, totalBytes, stop, barDone)
-	rsyncErr := rc.Wait()
+	go progressBar(fetched.Load, totalBytes, label, stop, barDone)
+	fetchErr := parallelFetch(files, dest, streams, &fetched, &doneFiles)
 	close(stop)
 	<-barDone
 
-	if rsyncErr != nil {
-		if msg := strings.TrimSpace(rsyncErrBuf.String()); msg != "" {
-			fail(msg)
-		}
-		fail(fmt.Sprintf("rsync 失败: %v", rsyncErr))
+	if fetchErr != nil {
+		fail(fmt.Sprintf("下载失败: %v", fetchErr))
 		info("已传输的部分会保留，重跑同一条命令可断点续传")
 		os.Exit(1)
 	}
@@ -1928,7 +2169,7 @@ func cmdGet(args []string) {
 	// Verify.
 	bad := 0
 	for _, f := range files {
-		base := filepath.Base(f)
+		base := f.base
 		local := filepath.Join(dest, base)
 		fi, err := os.Stat(local)
 		if err != nil {

@@ -83,6 +83,7 @@ spod get /project/foo/bar.mp4                    # → C:\Users\<you>\Downloads
 spod get '/project/foo/*.mp4'                    # globs expand on the remote
 spod get /project/foo/a.mp4 -o 'C:\Users\me\Desktop'   # Windows paths accepted
 spod get /project/foo/a.mp4 -o ./data            # or any local dir
+SPOD_GET_STREAMS=6 spod get /project/foo/a.mp4   # more parallel streams (1-16, default 4)
 ```
 
 `spod get` records each file's MD5 **before** transferring, then verifies after.
@@ -91,9 +92,26 @@ to `.nfsXXXX`, rsync still exits 0, and the original path is gone — leaving
 nothing to check against unless the digest was taken up front. Re-running the
 same command resumes from where it stopped (`--append-verify`).
 
-Transfers are deliberately a **single** rsync stream: the VPN link saturates at
-about one stream's bandwidth, and splitting into parallel streams measurably
-lowers aggregate throughput (measured 255 KB/s single vs 115+93 KB/s split).
+Transfers fan out over **4 independent SSH connections** by default
+(`SPOD_GET_STREAMS=1..16`), each pulling byte ranges via `dd` and pwriting them
+into the preallocated destination file. Resume state lives in a
+`.<name>.spodget` sidecar — the file is full-length with holes while in flight,
+so its size proves nothing about what completed.
+
+Why parallel: the VPN has no ESP/UDP channel (see below), so inner RTT is
+~300 ms and any *single* TCP flow is pinned near 255 KB/s no matter how much
+bandwidth is free. Measured on this link: 1 flow 254 KB/s, 3 flows 427 KB/s,
+6 flows 695 KB/s; end-to-end `spod get` went 254 → 946 KB/s at 4 streams.
+8 streams was slower than 4 (863 KB/s) — extra logins and tail imbalance.
+
+**Each stream needs its own `ControlPath`.** `Host superpod` sets
+`ControlMaster auto` on a shared socket, so plain parallel transfers all become
+channels on *one* TCP connection sharing *one* congestion window — measured at
+100 KB/s versus 254 KB/s for a dedicated connection. An earlier note here
+claimed parallel streams *lowered* throughput; that measurement was run through
+the shared mux and was measuring exactly this collapse, not a link ceiling.
+`getSSHOpts()` gives each worker a private socket, reused across all of its
+chunks so a big file costs 4 logins, not one per chunk.
 
 ## SuperPod Remote Setup
 
@@ -112,6 +130,7 @@ Codex is installed globally in the `claude` conda env on SuperPod (`npm install 
 
 ## Critical Gotchas
 
+- **The VPN runs with ESP/UDP disabled, and that is the bandwidth ceiling.** Because openconnect is launched with `--proxy http://127.0.0.1:7890`, its datagram channel cannot traverse the HTTP CONNECT proxy — the log says `Set up UDP failed; using SSL instead` / `ESP disabled`, and every packet becomes TCP-over-TCP through Clash. Result: inner RTT 233–494 ms with `cwnd` stuck at 2–5 segments, so one TCP flow tops out near 255 KB/s. Diagnose with `grep -E "ESP|UDP failed" vpn.log` and `ss -tino | grep -A1 143.89`. Clash itself is *not* the cap (measured 1.77 MB/s to Cloudflare). Note `remote.ust.hk` is reachable without the proxy (~127 ms), but this machine's raw ISP path to the internet is much slower than Clash (126 KB/s vs 1.77 MB/s), so dropping `--proxy` to regain ESP is a real experiment, not an obvious win — measure before changing it.
 - **vpn-slice must exist at `.venv/bin/vpn-slice`** — openconnect calls it as a script. If missing, VPN connects but routing breaks and SSH port 22 is unreachable despite ping working.
 - **VPN script uses system python** (`python3 hkust-vpn.py`) but references `.venv/bin/vpn-slice` as path. The system python needs `pyotp` and `playwright` installed (or use .venv python).
 - **Clash proxy on port 7890** must be running locally before VPN connects (openconnect uses it as `--proxy`).
