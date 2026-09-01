@@ -898,12 +898,21 @@ func ensureTunnel() {
 		warn(fmt.Sprintf("无法打开日志文件: %v", err))
 	}
 
+	// ControlPath=none is load-bearing, not belt-and-braces. ensureSSHConfig
+	// gives every target `ControlMaster auto` + a shared ControlPath, and
+	// `ControlMaster=no` alone only says "don't *become* the master" — the
+	// child still *joins* an existing mux, hands the -R to that master, and
+	// exits 0. autossh sees a clean exit and quits, so the forward survives
+	// only as long as the mux's ControlPersist window: tunnelPID() finds
+	// nothing, the port looks like a peer's tunnel, and it dies minutes later
+	// with no autossh to rebuild it. Own socket = own connection = own life.
 	cmd := exec.Command("autossh", "-M", "0", "-f", "-N",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
 		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
 		"-R", fmt.Sprintf("%s:127.0.0.1:%s", tunnelPort, localPort),
 		host,
 	)
@@ -1058,12 +1067,15 @@ func ensureSocks() {
 		warn(fmt.Sprintf("无法打开日志文件: %v", err))
 	}
 
+	// ControlPath=none for the same reason as the reverse tunnel above: a
+	// mux-borne -D dies with the master's ControlPersist window.
 	cmd2 := exec.Command("autossh", "-M", "0", "-f", "-N",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
 		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
 		"-D", fmt.Sprintf("0.0.0.0:%s", socksPort),
 		host,
 	)
