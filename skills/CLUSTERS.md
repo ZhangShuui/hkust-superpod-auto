@@ -86,14 +86,64 @@ HPC4 (`gpu:a30:4`, `gpu:l20:2`, `gpu:4090d:1`, `gpu:rtx5880:2`, `gpu:3090:8`,
 
 ### HPC4 has no Pyxis — the SuperPod srun template will not run
 There is no `enroot`, and `srun --container` on HPC4 means an *OCI bundle
-directory*, not an enroot `.img`. Every SuperPod flag below is a hard error on
-HPC4: `--container-image`, `--container-mounts`, `--container-save`,
+directory* (with no OCI runtime installed — no `crun`/`runc`), not an enroot
+`.img`. Every SuperPod flag below is a hard error on HPC4:
+`--container-image`, `--container-mounts`, `--container-save`,
 `--container-remap-root`, `--no-container-mount-home`, `--container-writable`,
-`--container-env`. Use one of these on HPC4 instead:
-- **conda** (`~/anaconda3`, or `module load miniconda3/24.3.0-quc3pyu`) — the
-  default for most work;
-- **Apptainer/Singularity** — `apptainer exec --nv image.sif …` *inside* the
-  job step, not as srun flags.
+`--container-env`. Use **conda** (`~/anaconda3`, or
+`module load miniconda3/24.3.0-quc3pyu`) or **Apptainer** — see below.
+
+### HPC4 Docker images: Apptainer, and only on a compute node
+Verified on HPC4 2026-09-01 (Apptainer 1.5.2, `singularity` is a symlink to it).
+The constraints are unusual, so read this before planning an image workflow.
+
+| | Login node (`login4`) | Compute node |
+|---|---|---|
+| `max_user_namespaces` | **0** | 2043336 |
+| Apptainer usable at all | **no** | yes |
+
+**Everything Apptainer must happen inside a job step.** On `login4` there are no
+user namespaces and no `starter-suid` (only `starter` is installed), so even
+`apptainer exec` cannot create a container. Nothing about this is obvious from
+the error text — you get a build/mount failure, not "wrong node".
+
+**What works** (tested on `gpu13`):
+- `apptainer build --sandbox DIR docker://IMAGE` — pulls straight from the
+  registry and unpacks to a directory. `registry-1.docker.io`, `nvcr.io`,
+  `quay.io` and `ghcr.io` are all reachable **directly** from HPC4, no proxy
+  and no tunnel, so this is far faster than uploading an image over the VPN.
+- `apptainer exec --nv DIR CMD` — runs, and `--nv` really does expose
+  `/dev/nvidia0`.
+- `apptainer exec --writable DIR sh -c 'apt/apk/pip install …'` — changes
+  **persist** into the sandbox. This is the analogue of SuperPod's
+  `--container-writable` + `--container-save`, and it does not need
+  `--fakeroot`.
+- `/home`, `/project` and `/scratch` are bound into the container automatically.
+
+**What does not work:**
+- **Creating a `.sif` on HPC4.** `apptainer build x.sif …` shells out to
+  `mksquashfs` through `proot`, and `ptrace_scope = 3` on every node kills
+  `proot` outright (`ptrace(TRACEME): Operation not permitted`).
+  `PROOT_NO_SECCOMP=1`, which the error itself suggests, does not help. The
+  bundled `mksquashfs` works fine when invoked directly, so this is purely
+  Apptainer's proot path. Build `.sif` files elsewhere, or stay on sandboxes.
+- **`apptainer build` from a def file with a `%post` section** — needs root,
+  a suid install, or a `/etc/subuid` entry; HPC4 has none of the three.
+- `--fakeroot` — no `/etc/subuid` mapping for the user.
+
+**Site-config gotcha:** some CPU nodes carry a stale
+`bind path = /opt/knem-1.1.4.90mlnx3` in `/etc/apptainer/apptainer.conf` while
+the directory does not exist there, and Apptainer treats the failed mount as
+fatal:
+`container creation failed: mount hook function failure: … doesn't exist`.
+It is not your image. Work around it with
+`apptainer exec --no-mount /opt/knem-1.1.4.90mlnx3 …` or `--contain`. GPU nodes
+did not show the stale entry.
+
+**Choosing a format:** a sandbox is a directory of many small files, which is
+slow and inode-hungry on the NFS-backed `/home` and `/project`. Prefer a
+single `.sif` built off-cluster when the image is large or long-lived, and keep
+sandboxes on node-local `/tmp` (196 GB, wiped per job) or `/scratch` (500 GB).
 
 ### Both: `--account` is mandatory
 Omitting it fails with `Please kindly add the --account … SLURM flag`, not with

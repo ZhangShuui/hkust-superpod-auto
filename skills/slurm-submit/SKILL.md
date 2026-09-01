@@ -165,8 +165,27 @@ srun --export=ALL <USER_COMMANDS>
   training then fails on a missing device. Valid types: `a30`, `l20`, `4090d`,
   `rtx5880`, `3090`, `6000ada`. Match the type to the partition.
 - **No `--container-*` flags.** There is no enroot; `srun --container` on HPC4
-  means an OCI bundle directory, not an enroot `.img`. Pasting the SuperPod
-  template here is the single most likely failure.
+  means an OCI bundle directory (and no OCI runtime is installed), not an
+  enroot `.img`. Pasting the SuperPod template here is the single most likely
+  failure.
+- **Apptainer only runs inside the job step, never on `login4`** — the login
+  node has `max_user_namespaces = 0` and no `starter-suid`, so containers
+  cannot be created there at all. Put every `apptainer` call inside the
+  `srun`/batch body:
+
+  ```bash
+  # pull straight from the registry (HPC4 reaches docker.io/nvcr.io directly)
+  apptainer build --sandbox $TMPDIR/img docker://nvcr.io/nvidia/pytorch:24.05-py3
+  apptainer exec --nv --bind /project/<account> $TMPDIR/img python train.py
+  ```
+
+  `.sif` files cannot be *created* on HPC4 (`mksquashfs` runs through `proot`,
+  and `ptrace_scope=3` blocks it) — build them off-cluster and copy them in, or
+  work from sandbox directories. `apptainer exec --writable <sandbox>` persists
+  installs, which is the closest thing to SuperPod's `--container-save`.
+  If a mount hook fails on `/opt/knem-…`, add
+  `--no-mount /opt/knem-1.1.4.90mlnx3`; that is a stale site bind path on some
+  CPU nodes, not a problem with your image.
 - Set `--cpus-per-task` explicitly (~16 per GPU); the GPU partitions have
   64 CPUs across 4–6 GPUs.
 - `module` is Lmod over Spack — `module load cuda/12.4.0-uhdfj7w`,
