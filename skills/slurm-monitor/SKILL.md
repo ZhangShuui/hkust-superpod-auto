@@ -1,22 +1,39 @@
 ---
 name: slurm-monitor
-description: "Monitor SLURM jobs on HKUST SuperPod — check queue, read logs, inspect node status, track GPU usage. Read-only operations, safe to run anytime."
-argument-hint: "[jobid] [--full] [--tail N] [--nodes] [--quota]"
+description: "Monitor SLURM jobs on HKUST SuperPod or HPC4 — check queue, read logs, inspect node status, track GPU usage. Read-only operations, safe to run anytime."
+argument-hint: "[superpod|hpc4] [jobid] [--full] [--tail N] [--nodes] [--quota]"
 allowed-tools: Read, Glob, Grep, Bash(ssh:*), Bash(timeout:*), Bash(cat:*), Bash(spod:*)
 ---
 
 # SLURM Job Monitor
 
-Monitor jobs and cluster status on SuperPod via SSH. All operations are **read-only**.
+Monitor jobs and cluster status via SSH. All operations are **read-only**.
 
-## Connection
+## Step 0: Pick the cluster
 
-- SSH target: `superpod`
-- Prerequisite: VPN running
+Read the leading word of `$ARGUMENTS`:
 
-## Parse Arguments
+| Argument | Cluster | SSH alias (`$CLUSTER`) | Hostname |
+|----------|---------|------------------------|----------|
+| `hpc4` | HPC4 | `hpc4` | `hpc4.ust.hk` |
+| `superpod` or absent | SuperPod | `superpod` | `superpod.ust.hk` |
 
-From `$ARGUMENTS`, determine the operation mode:
+Everything below uses `$CLUSTER`. The clusters have separate accounts, jobs
+and queues — never report one's numbers under the other's name, and always
+label the output with which cluster it came from.
+
+Two mechanical differences show up throughout:
+
+- **`module load slurm`** is needed on SuperPod, is a no-op on HPC4 (slurm
+  lives in `/usr/bin`). Keeping `module load slurm 2>/dev/null` in the
+  command is harmless on both, so the snippets below all carry it.
+- **`savail` exists only on SuperPod.** On HPC4, derive availability from
+  `sinfo` instead. Full table in
+  `~/wkspace/hkust-superpod-auto/skills/CLUSTERS.md`.
+
+Prerequisite for both: VPN running (`spod vpn status`).
+
+## Parse remaining arguments
 
 | Input | Mode |
 |-------|------|
@@ -34,80 +51,74 @@ Options:
 ### 1a. Check running/pending jobs
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && squeue -u $USER -o "%i %j %P %T %M %l %D %C %b %N" --noheader'
+ssh $CLUSTER 'module load slurm 2>/dev/null; squeue -u $USER -o "%i %j %P %T %M %l %D %C %b %N" --noheader'
 ```
 
-If jobs found, display as a formatted table:
+Display as a formatted table:
 
 | JobID | Name | Partition | State | Runtime | Timelimit | Nodes | CPUs | GPUs | NodeList |
 |-------|------|-----------|-------|---------|-----------|-------|------|------|----------|
 
+If the GPU column is empty on an HPC4 job that was meant to use GPUs, that is
+the `--gpus` gotcha, not a display bug: HPC4 only counts GPUs requested via
+`--gres=gpu:<type>:N`, so a `--gpus`-only job really was scheduled with none.
+
 ### 1b. Check recently completed jobs (last 24h)
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && sacct -u $USER --starttime now-1day --format=JobID%10,JobName%20,Partition%10,State%12,ExitCode%8,Elapsed%12,NNodes%6,NCPUS%6,TRESUsageInTot%40 --noheader | head -20'
+ssh $CLUSTER 'module load slurm 2>/dev/null; sacct -u $USER --starttime now-1day --format=JobID%10,JobName%20,Partition%14,State%12,ExitCode%8,Elapsed%12,NNodes%6,NCPUS%6,TRESUsageInTot%40 --noheader | head -20'
 ```
 
-Display completed jobs, highlighting:
+Highlight:
 - **COMPLETED** — success
 - **FAILED** / **CANCELLED** — needs attention
-- **TIMEOUT** — job hit walltime limit
+- **TIMEOUT** — hit walltime. On both clusters the binding limit is usually the
+  **QOS** MaxWall, not the partition (partitions advertise `infinite`).
 - **OUT_OF_MEMORY** — OOM, suggest reducing batch size
 
 ### 1c. Quick cluster health
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && sinfo -o "%P %a %F" --noheader'
+ssh $CLUSTER 'module load slurm 2>/dev/null; sinfo -o "%P %a %F" --noheader'
 ```
 
-Show partition availability as: `partition: A/I/O/T` (Allocated/Idle/Other/Total).
+Show partition availability as `partition: A/I/O/T` (Allocated/Idle/Other/Total).
 
-## Mode 2: Specific Job (`/slurm-monitor <jobid>`)
+## Mode 2: Specific Job (`/slurm-monitor [cluster] <jobid>`)
 
 ### 2a. Job status
 
 ```bash
-ssh superpod "module load slurm 2>/dev/null && scontrol show job <JOBID> 2>/dev/null || sacct -j <JOBID> --format=JobID,JobName,Partition,State,ExitCode,Elapsed,NNodes,NCPUS,NodeList%30,Reason%50 --noheader"
+ssh $CLUSTER "module load slurm 2>/dev/null; scontrol show job <JOBID> 2>/dev/null || sacct -j <JOBID> --format=JobID,JobName,Partition,State,ExitCode,Elapsed,NNodes,NCPUS,NodeList%30,Reason%50 --noheader"
 ```
 
-Extract and display:
-- State, runtime, timelimit
-- Allocated nodes
-- Exit code (if completed)
-- Reason (if pending/failed)
+Extract: state, runtime, timelimit, allocated nodes, exit code, reason.
 
 ### 2b. Find and read logs
 
-Search for log files matching this job:
-
 ```bash
-ssh superpod "find /home/$USER -maxdepth 3 -name '*<JOBID>*' -newer /home/$USER -mtime -7 2>/dev/null | head -10"
+ssh $CLUSTER "find /home/\$USER -maxdepth 3 -name '*<JOBID>*' -mtime -7 2>/dev/null | head -10"
 ```
 
 Also check standard locations:
 ```bash
-ssh superpod "ls -la /home/$USER/*/logs/*<JOBID>* 2>/dev/null; ls -la /home/$USER/logs/*<JOBID>* 2>/dev/null"
+ssh $CLUSTER "ls -la /home/\$USER/*/logs/*<JOBID>* 2>/dev/null; ls -la /home/\$USER/logs/*<JOBID>* 2>/dev/null"
 ```
 
-For each log file found (`.out` and `.err`):
-- If `--full`: show complete content
-- If `--tail N`: show last N lines
-- Default: show last 30 lines
+For each `.out` / `.err` found:
+- `--full`: complete content
+- `--tail N`: last N lines
+- default: last 30 lines
 
 ```bash
-ssh superpod "tail -<N> <LOG_PATH>"
+ssh $CLUSTER "tail -<N> <LOG_PATH>"
 ```
 
 ### 2c. Training progress detection
 
-If the log contains training output, try to extract:
-- Current step / total steps
-- Current loss value
-- Learning rate
-- Estimated time remaining
-- Any errors or warnings
+If the log contains training output, extract current step / total, loss,
+learning rate, ETA, and any errors. Common patterns:
 
-Look for common patterns:
 ```
 step N/M, loss: X.XXX
 Epoch N/M
@@ -116,42 +127,53 @@ train_loss: X.XXX
 
 Report progress as a brief summary.
 
-## Mode 3: Node Status (`/slurm-monitor --nodes`)
+## Mode 3: Node Status (`--nodes`)
 
 ### 3a. Full node status
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && sinfo -N -o "%N %P %T %c %m %G %E" --noheader | sort'
+ssh $CLUSTER 'module load slurm 2>/dev/null; sinfo -N -o "%N %P %T %c %m %G %E" --noheader | sort'
 ```
 
-### 3b. GPU availability by partition
+### 3b. GPU availability
 
+**SuperPod** (has the `savail` wrapper):
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && savail -p normal 2>/dev/null; echo "---"; savail -p preempt 2>/dev/null'
+ssh superpod 'module load slurm 2>/dev/null; savail -p normal 2>/dev/null; echo "---"; savail -p preempt 2>/dev/null'
 ```
+
+**HPC4** (no `savail` — read it off `sinfo`):
+```bash
+ssh hpc4 'sinfo -p gpu-a30,gpu-l20,gpu-rtx4090d,gpu-rtx5880,hpc3gpu-math1,hpc3gpu-math2 -o "%P %N %T %G %C" --noheader'
+```
+Idle nodes in a GPU partition are free capacity; `mixed` nodes have some GPUs
+left, `allocated` have none. Confirm a specific node with
+`scontrol show node <N>` and compare `AllocTRES` against `CfgTRES`.
 
 ### 3c. Problem nodes
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && sinfo -o "%N %T %E" --noheader | grep -iE "drain|down|error|fail"'
+ssh $CLUSTER 'module load slurm 2>/dev/null; sinfo -o "%N %T %E" --noheader | grep -iE "drain|down|error|fail"'
 ```
 
-Output a recommended `--exclude` list for use with `srun`/`sbatch`.
+Output a recommended `--exclude` list from what you actually see. Do not carry
+over a hardcoded list from a previous run.
 
-## Mode 4: Quota (`/slurm-monitor --quota`)
+## Mode 4: Quota (`--quota`)
 
 ```bash
-ssh superpod 'module load slurm 2>/dev/null && squota 2>/dev/null'
+ssh $CLUSTER 'module load slurm 2>/dev/null; squota 2>/dev/null'
 ```
 
-Display GPU/CPU hours usage and remaining balance.
+Present on both clusters, but the table layouts differ: SuperPod reports
+GPU/CPU hours against the allocation; HPC4 prints a per-account, per-partition
+box-drawing table (one block per account, e.g. `kanichen` and `migrate`).
+Strip the ANSI escapes before reformatting HPC4's output.
 
 ## Output Format
 
-Always structure output as:
-
 ```
-## SLURM Status — <timestamp>
+## SLURM Status — <CLUSTER> — <timestamp>
 
 ### Running Jobs
 <table or "No running jobs">
@@ -163,11 +185,17 @@ Always structure output as:
 <partition availability summary>
 
 ### Alerts
-- <any failed jobs, problem nodes, quota warnings>
+- <failed jobs, problem nodes, quota warnings>
 ```
+
+Always name the cluster in the header.
 
 ## Safety
 
 - This skill is **read-only**. It never modifies, submits, or cancels jobs.
-- All commands are `squeue`, `sacct`, `sinfo`, `scontrol show`, `find`, `tail`, `cat` — no side effects.
-- If the user asks to cancel or resubmit from within this skill, direct them to use `scancel` manually or `/slurm-submit`.
+- All commands are `squeue`, `sacct`, `sinfo`, `scontrol show`, `savail`,
+  `squota`, `find`, `tail`, `cat` — no side effects.
+- If the user asks to cancel or resubmit, direct them to `scancel` or
+  `/slurm-submit`.
+- Login nodes are for inspection only on both clusters — never run anything
+  heavier than `tail` from here.

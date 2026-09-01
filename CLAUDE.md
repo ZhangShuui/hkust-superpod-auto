@@ -44,6 +44,7 @@ One-command toolkit for connecting to HKUST SuperPod (and HPC4) from WSL2 and ru
 | `hkust-vpn.py` | VPN auto-login: Playwright (Microsoft SSO + TOTP MFA) + openconnect + vpn-slice |
 | `.env` | All credentials and config (gitignored, real secrets — never commit) |
 | `docs/` | Detailed docs on VPN, SLURM, sync |
+| `skills/` | Claude Code skills for both clusters — symlinked into `~/.claude/skills/` |
 
 ## Architecture
 
@@ -152,6 +153,30 @@ scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
 ```
 
 Codex is installed globally in the `claude` conda env on SuperPod (`npm install -g @openai/codex`).
+
+## Skills
+
+`skills/` holds the Claude Code skills for this toolchain. They are the source
+of truth and are symlinked into `~/.claude/skills/` — edit them here, not there:
+
+```bash
+for s in hkust-superpod-session slurm-info slurm-monitor slurm-submit; do
+  ln -sfn "$(pwd)/skills/$s" ~/.claude/skills/$s
+done
+```
+
+| Skill | Scope |
+|-------|-------|
+| `skills/CLUSTERS.md` | Shared SuperPod-vs-HPC4 fact sheet every other skill reads |
+| `hkust-superpod-session` | Interactive session: VPN → `spod` tmux → `srun` allocation |
+| `slurm-info` | Cache partitions / GRES / QOS caps / accounts, per cluster |
+| `slurm-monitor` | Read-only queue, logs, node status |
+| `slurm-submit` | Generate + submit batch jobs |
+
+All four take an optional leading `superpod` / `hpc4` word, mirroring the CLI.
+The clusters are **not** interchangeable: HPC4 has no Pyxis/enroot, and needs
+`--gres=gpu:<type>:N` (a bare `--gpus` there yields a GPU-less allocation that
+still starts). See `skills/CLUSTERS.md` before generating any SLURM command.
 
 ## Critical Gotchas
 
