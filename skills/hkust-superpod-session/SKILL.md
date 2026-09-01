@@ -269,6 +269,23 @@ container state is preserved in the `.img`.
   with the proxy; git/pip/npm go direct. HPC4 reaches the internet directly but
   the AI API endpoints are 403 there, so the tunnel is required, not optional.
 
+### Downloads must not go through the relay
+
+Keep it that way. The relay tunnels back to the local Clash and out over the
+VPN, where a single flow tops out near 255 KB/s, so a container pull, a big
+`pip install` or a dataset download sent through it is both glacially slow and
+the quickest way to starve `claude`/`codex` of the channel they need.
+
+A plain shell is already clean, but `srun` defaults to `--export=ALL`, so
+whatever the submitting shell carries follows you onto the compute node. Before
+anything that downloads, be explicit:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+```
+
+Check with `env | grep -i proxy` if a download is inexplicably slow.
+
 ## Related skills
 
 - `/slurm-info [cluster]` — cache current partitions, GRES strings, QOS caps

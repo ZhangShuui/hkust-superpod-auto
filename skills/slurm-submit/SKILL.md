@@ -174,6 +174,11 @@ srun --export=ALL <USER_COMMANDS>
   `srun`/batch body:
 
   ```bash
+  # Downloads go DIRECT. srun defaults to --export=ALL, so drop any proxy the
+  # submitting shell carried in — the spod relay is for the AI APIs only, and
+  # routing a multi-GB pull through it starves claude/codex and crawls.
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
   # pull straight from the registry (HPC4 reaches docker.io/nvcr.io directly)
   apptainer build --sandbox $TMPDIR/img docker://nvcr.io/nvidia/pytorch:24.05-py3
   apptainer exec --nv --bind /project/<account> $TMPDIR/img python train.py

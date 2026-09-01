@@ -107,6 +107,23 @@ user namespaces and no `starter-suid` (only `starter` is installed), so even
 `apptainer exec` cannot create a container. Nothing about this is obvious from
 the error text — you get a build/mount failure, not "wrong node".
 
+**Never pull through the spod proxy.** The relay at `127.0.0.1:18140` is a
+narrow channel for the AI APIs only: it tunnels back to the local Clash and out
+over the VPN, where one TCP flow tops out near 255 KB/s. Pushing a multi-GB
+image, a `pip install`, or an `apt` through it is both glacially slow and the
+fastest way to starve the relay out from under `claude`/`codex`. HPC4 reaches
+the public internet directly, so downloads want no proxy at all.
+
+The remote `~/.bashrc` already unsets `http_proxy`/`https_proxy` and re-exports
+them only inside the `claude()` and `codex()` wrapper functions, so a plain
+shell is clean. Do not rely on that: `srun` defaults to `--export=ALL`, so
+anything the submitting shell happens to carry lands in the job step. Unset
+explicitly at the top of any step that downloads:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+```
+
 **What works** (tested on `gpu13`):
 - `apptainer build --sandbox DIR docker://IMAGE` — pulls straight from the
   registry and unpacks to a directory. `registry-1.docker.io`, `nvcr.io`,
