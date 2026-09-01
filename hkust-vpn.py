@@ -134,7 +134,9 @@ def setup_credentials(user):
     try:
         totp = pyotp.TOTP(totp_secret)
         code = totp.now()
-        log.info(f"[+] TOTP test: current code = {code} (looks good)")
+        # Show it on the terminal so the user can compare with their authenticator,
+        # but do NOT log it — the handler writes vpn.log in plaintext.
+        print(f"[+] TOTP test: current code = {code} (compare with your app)")
     except Exception as e:
         log.error(f"[!] TOTP secret seems invalid: {e}")
         sys.exit(1)
@@ -456,7 +458,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
                 page.evaluate("() => document.querySelector('#idSubmit_SAOTCC_Continue')?.click()")
                 page.wait_for_timeout(2000)
             page.wait_for_load_state("networkidle", timeout=30000)
-            log.info(f"[+] TOTP code: {code}")
+            log.info("[+] TOTP code submitted.")  # never log the code itself — vpn.log is plaintext on disk
 
             # ── Step 5: "Stay signed in?" → Yes ──
             log.info("[*] Step 5/5: Stay signed in...")
@@ -531,7 +533,7 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             browser.close()
 
     if dsid:
-        log.info(f"[+] Got DSID cookie: {dsid[:20]}...")
+        log.info(f"[+] Got DSID cookie ({len(dsid)} chars).")  # value is a live VPN session token — never log it
         return dsid
     else:
         log.error("[-] Failed to get DSID cookie.")
