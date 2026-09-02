@@ -2648,6 +2648,10 @@ func printSessions(sessions []session) {
 }
 
 // ensureTmuxConfAndProxy writes the claude/codex proxy wrappers into ~/.bashrc.
+// The claude wrapper also exports CLAUDE_CODE_OAUTH_TOKEN from ~/.claude/oauth_token
+// when that file exists, so a cluster can run on its own long-lived grant instead
+// of a copied .credentials.json (whose single-use refresh token the first machine
+// to refresh consumes, leaving the other wiped with "Login expired").
 // Routes through relayPort when ensureRelay() confirmed the relay is up,
 // so short tunnel outages are absorbed via 900s upstream retry. Falls
 // back to direct tunnelPort if relay setup failed. Set SPOD_NO_RELAY=1
@@ -2671,7 +2675,9 @@ cat >> ~/.bashrc << 'SPOD_EOF'
 %s
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
 _spod_proxy="http://127.0.0.1:%s"
-claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+# spod: ~/.claude/oauth_token (from a local 'claude setup-token') gives this host its own long-lived grant;
+# a shared .credentials.json breaks because refresh tokens are single-use (first machine to refresh wins)
+claude() { local _tok=0; if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -r "$HOME/.claude/oauth_token" ]; then export CLAUDE_CODE_OAUTH_TOKEN="$(<"$HOME/.claude/oauth_token")"; _tok=1; fi; export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; [ "$_tok" = 1 ] && unset CLAUDE_CODE_OAUTH_TOKEN; return $rc; }
 codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command codex "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
 %s
 SPOD_EOF`,
