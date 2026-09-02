@@ -139,20 +139,99 @@ the shared mux and was measuring exactly this collapse, not a link ceiling.
 `getSSHOpts()` gives each worker a private socket, reused across all of its
 chunks so a big file costs 4 logins, not one per chunk.
 
-## SuperPod Remote Setup
+## Remote Setup (both clusters)
 
-After VPN + SSH are working, sync local credentials to SuperPod so Claude Code and Codex can call their APIs:
+Both clusters use the **same layout**: a standalone Node 24 at `~/.local/node24`
+(its own npm prefix — no conda), with `claude` and `codex` installed globally into
+it. Replace `superpod` with `hpc4` below to set up the other cluster.
 
 ```bash
-# Codex credentials (ChatGPT auth, stored in ~/.codex/)
+# 1. Install the CLIs (npm registry is reachable DIRECTLY from both clusters —
+#    do not proxy this; the tunnel is only for the API calls at runtime)
+ssh superpod 'bash -lc "npm install -g @anthropic-ai/claude-code @openai/codex"'
+
+# 2. Claude auth — give each cluster its OWN grant. Do NOT scp ~/.claude/.credentials.json
+#    (refresh tokens are single-use; see the gotcha below). Recommended: a long-lived
+#    token, which never refreshes and so also survives tunnel outages:
+claude setup-token                                   # locally, browser flow; prints sk-ant-oat01-…
+ssh superpod 'umask 077; mkdir -p ~/.claude; cat > ~/.claude/oauth_token'   # paste it, Ctrl-D
+#    spod's claude() wrapper exports it as CLAUDE_CODE_OAUTH_TOKEN for that call only.
+#    Alternative: run `claude` on the cluster and `/login` (URL flow). Refreshes then
+#    go through the relay, so the tunnel must be up whenever the token expires.
+
+# 3. Codex credentials
 ssh superpod 'mkdir -p ~/.codex'
 scp ~/.codex/auth.json ~/.codex/config.toml superpod:~/.codex/
+
+# 4. Settings — copy the CLUSTER version, not your local ~/.claude/settings.json
+#    (the local one has hooks pointing at local-only paths). The cluster version
+#    pins autoUpdates:false + DISABLE_AUTOUPDATER=1.
+ssh superpod 'cat ~/.claude/settings.json' | ssh hpc4 'cat > ~/.claude/settings.json'
+
+# 5. Mark onboarding complete — otherwise EVERY launch runs the 10 s first-run
+#    preflight (gotcha below) and dies on this link
+ssh hpc4 'test -f ~/.claude.json || echo "{}" > ~/.claude.json; jq ".hasCompletedOnboarding=true | .theme=\"dark\"" ~/.claude.json > ~/.claude.json.new && mv ~/.claude.json.new ~/.claude.json'
 
 # Proxy is auto-configured by spod — only claude/codex commands get proxy env vars
 # (via shell wrapper functions in remote ~/.bashrc), git/pip/npm etc. go direct
 ```
 
-Codex is installed globally in the `claude` conda env on SuperPod (`npm install -g @openai/codex`).
+`npm install` warns `allow-scripts ... postinstall: node install.cjs` for
+claude-code. Ignore it — the package ships the `bin/claude.exe` native binary and
+the symlink is created regardless. Do **not** enable allow-scripts to silence it.
+
+**Keep `autoUpdates` off.** The homes are NFS, which cannot unlink the running
+300 MB `claude.exe`; it silly-renames to `.nfsXXXX`, the update half-installs, and
+`claude` disappears. See `~/.claude/.last-update-result.json` for `install_failed`.
+
+### Gotcha: `timeout claude ...` silently bypasses the proxy
+
+`claude` and `codex` are **shell functions** in the remote `~/.bashrc` — that is
+what injects `http_proxy`. Any external command in front of them (`timeout`,
+`env`, `nohup`, `xargs`) execs the PATH binary directly and skips the function, so
+the request goes out direct and dies as:
+
+```
+Failed to authenticate. API Error: 403 Request not allowed
+```
+
+That 403 is indistinguishable from an expired token or a rate limit. To wrap the
+call, export the proxy yourself and use `command claude`:
+
+```bash
+export https_proxy=http://127.0.0.1:$RELAY_PORT http_proxy=$https_proxy
+timeout 180 command claude -p "..."
+```
+
+### Gotcha: "Unable to connect to Anthropic services … timed out after 10 seconds"
+
+This is the **first-run preflight**, and it only runs while `hasCompletedOnboarding`
+is unset in `~/.claude.json`. It fetches `${API}/api/hello` and
+`${TOKEN_URL}/v1/oauth/hello` with a hard-coded 10 s budget (`var ce=1e4`),
+demands HTTP 200 from both, and `process.exit(1)`s otherwise;
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` does not skip it. Over this VPN a TLS
+handshake through the relay swings between 1 s and 25 s, so a cluster stuck in
+onboarding (nobody ever picked a theme) fails ~30 % of launches. Step 5 above ends
+it. `claude -p` never runs the preflight, which is why print mode "worked" while
+the TUI didn't. Diagnose deterministically with a black-hole proxy — if the message
+still appears, onboarding is not marked complete:
+
+```bash
+python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",18999));s.listen(5);c=[]
+while True: c.append(s.accept())' &
+https_proxy=http://127.0.0.1:18999 command claude
+```
+
+### Gotcha: one credentials file on many machines → "Login expired"
+
+OAuth refresh tokens are single-use. If two machines hold the same
+`~/.claude/.credentials.json`, the first one to refresh (an active session refreshes
+~5 min before `expiresAt`) invalidates the other's refresh token; when that one
+expires it is rejected and Claude Code **wipes the file** (`expiresAt: 0`,
+`Login expired · Please run /login`). Independent grants coexist fine — SuperPod's
+own grant refreshed at 11:58 while the local one refreshed at 17:17 and both kept
+working — so the fix is one grant per machine (step 2), never a shared copy. Copying
+a fresh file only buys time until the next expiry.
 
 ## Skills
 
