@@ -66,6 +66,9 @@ spush -l                          # 看还有什么没被取走
 ```
 
 本地没开 `spod recv` 也能推 —— 队列一直留着，下次 `spod recv` 一起取。
+集群上跑的 agent 同样用它，但要写**绝对路径** `~/.local/bin/spush`（agent 的 shell
+不是登录 shell，函数不在）；spod 会在集群的 `~/.claude/CLAUDE.md` 里维护一段说明，
+所以那边的 Claude Code 自己就知道怎么发文件回来。
 `spush` 由 spod 自动部署（`~/.local/bin/spod-push` + `spush` 软链 + bashrc 包装），
 每次连接会检查版本。
 

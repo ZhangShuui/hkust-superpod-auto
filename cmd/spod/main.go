@@ -2788,6 +2788,56 @@ chmod 755 ~/.local/bin/spod-push.new && mv -f ~/.local/bin/spod-push.new ~/.loca
 	}
 }
 
+// agentNote is the block spod keeps in the cluster's ~/.claude/CLAUDE.md, so a
+// Claude Code session running THERE knows how to hand a file back to the user.
+// It cannot be left to the shell wrapper alone: an agent's Bash tool runs a
+// non-login shell whose snapshot was taken before this feature existed, so the
+// `spush` function is usually absent and only the absolute path works.
+const agentNoteBegin = "<!-- spod-agent-begin -->"
+const agentNoteEnd = "<!-- spod-agent-end -->"
+
+const agentNoteBody = `## Sending a file back to the user's local machine
+
+This cluster cannot open a connection to the user's machine. Queue the file with
+the spod push helper instead — their local ` + "`spod recv`" + ` pulls it:
+
+    ~/.local/bin/spush <file>...          # use the absolute path: the spush shell
+                                          # function exists only in login shells
+    ~/.local/bin/spush -d run7 results/   # a directory keeps its tree
+    ~/.local/bin/spush -w 300 out.mp4     # wait up to 300s; exits 1 if it did not arrive
+    ~/.local/bin/spush -l                 # what is still queued
+
+Files land in the user's Windows Downloads folder (or wherever their ` + "`spod recv`" + `
+points). If nothing is receiving, spush says so and the entry stays queued — tell
+the user to run ` + "`spod recv`" + ` locally rather than retrying. Queue a path that will
+still exist later: the pull happens afterwards and fails if the job removed the
+file. Throughput is ~1 MB/s, so tar or subset large results before queueing.
+
+Managed by spod — edits here are overwritten on the next connect.`
+
+// ensureAgentNote installs that block, replacing any previous copy.
+//
+// The blank separator has to be stripped in its own pass: sed's `$` matches the
+// last line of the *input*, which is the end marker being deleted, so a
+// same-pass `${/^$/d}` never sees the blank and the file grows by one line on
+// every connect.
+func ensureAgentNote() {
+	script := fmt.Sprintf(`mkdir -p ~/.claude
+touch ~/.claude/CLAUDE.md
+sed -i '/%s/,/%s/d' ~/.claude/CLAUDE.md 2>/dev/null
+awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++) print l[i]}' ~/.claude/CLAUDE.md > ~/.claude/CLAUDE.md.spodtmp &&
+    mv -f ~/.claude/CLAUDE.md.spodtmp ~/.claude/CLAUDE.md
+[ -s ~/.claude/CLAUDE.md ] && printf '\n' >> ~/.claude/CLAUDE.md
+cat >> ~/.claude/CLAUDE.md << 'SPOD_NOTE_EOF'
+%s
+%s
+%s
+SPOD_NOTE_EOF`, agentNoteBegin, agentNoteEnd, agentNoteBegin, agentNoteBody, agentNoteEnd)
+	if _, err := ssh(script); err != nil {
+		warn(fmt.Sprintf("集群侧 agent 说明写入失败: %v", err))
+	}
+}
+
 // claimQueue takes ownership of everything queued on the cluster.
 //
 // The outbox is *renamed* under flock rather than truncated: ssh() retries a
@@ -2990,10 +3040,46 @@ func batchBySub(items []pushItem) []pushBatch {
 	return out
 }
 
+// statQueued re-stats queued paths on the cluster, returning current sizes for
+// the ones that are still readable regular files.
+//
+// A queued path can rot: the queue outlives the job that wrote it, and a file
+// that has been deleted (or silly-renamed by NFS) would fail every fetch. Left
+// alone such an entry is re-queued after each failure and the watch loop claims
+// it straight back — a poison entry that spins forever. Checking first lets
+// drainOnce drop it with a receipt instead.
+func statQueued(items []pushItem) map[string]int64 {
+	var quoted []string
+	seen := map[string]bool{}
+	for _, it := range items {
+		if seen[it.path] {
+			continue
+		}
+		seen[it.path] = true
+		quoted = append(quoted, shellQuote(it.path))
+	}
+	out, err := ssh("for p in " + strings.Join(quoted, " ") + `; do [ -f "$p" ] && [ -r "$p" ] && printf '%s\t%s\n' "$(stat -Lc %s "$p")" "$p"; done`)
+	if err != nil && out == "" {
+		return nil // treat as "unknown" — the fetch will report the real error
+	}
+	sizes := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		szStr, path, cut := strings.Cut(strings.TrimSpace(line), "\t")
+		if !cut {
+			continue
+		}
+		if sz, convErr := strconv.ParseInt(szStr, 10, 64); convErr == nil {
+			sizes[path] = sz
+		}
+	}
+	return sizes
+}
+
 // drainOnce claims the cluster's queue and pulls everything in it. It returns
-// how many files landed and verified, and whether the claim was cleaned up —
-// a false there means the same files would be claimed again, so the caller
-// must back off instead of looping straight back in.
+// how many files landed and verified, and whether the drain settled — false
+// means work was left on the cluster (an undeleted claim, or files re-queued
+// after a failure) that would be claimed straight back, so the caller must back
+// off instead of looping into it.
 func drainOnce(dest string) (int, bool) {
 	claimed, claims, err := claimQueue()
 	if err != nil {
@@ -3008,6 +3094,29 @@ func drainOnce(dest string) (int, bool) {
 	// of the claim from here on.
 	saveInflight(items)
 	clean := dropClaims(claims)
+
+	// Drop entries whose source no longer exists, with a receipt, rather than
+	// re-queueing them forever.
+	if sizes := statQueued(items); sizes != nil {
+		var live []pushItem
+		var gone []receipt
+		for _, it := range items {
+			sz, exists := sizes[it.path]
+			if !exists {
+				warn(fmt.Sprintf("源文件已不在集群上，丢弃: %s", it.path))
+				gone = append(gone, receipt{"fail", it.path, ""})
+				continue
+			}
+			it.size = sz
+			live = append(live, it)
+		}
+		writeReceipts(gone)
+		items = live
+		if len(items) == 0 {
+			saveInflight(nil)
+			return 0, clean
+		}
+	}
 
 	var totalBytes int64
 	for _, it := range items {
@@ -3061,7 +3170,7 @@ func drainOnce(dest string) (int, bool) {
 	if done > 0 {
 		ok(fmt.Sprintf("已收下 %d 个文件 → %s", done, displayPath(dest)))
 	}
-	return done, clean
+	return done, clean && len(failed) == 0
 }
 
 // waitForPush blocks on the cluster until something is queued, touching the
@@ -3233,6 +3342,7 @@ func cmdRecv(args []string) {
 		os.Exit(1)
 	}
 	ensurePushHelper()
+	ensureAgentNote()
 
 	if mode == "once" {
 		if n, _ := drainOnce(dest); n == 0 {
@@ -3644,6 +3754,7 @@ func ensureRemoteSetup() {
 	}
 	ensureTmuxConfAndProxy(relayOK)
 	ensurePushHelper()
+	ensureAgentNote()
 	ensureRemoteCLIs()
 }
 

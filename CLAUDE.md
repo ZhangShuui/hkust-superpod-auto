@@ -176,6 +176,14 @@ the parallel-stream throughput for free instead of a fresh single-flow protocol
 capped at 255 KB/s. Files with a different `-d` land in different batches
 (parallelFetch flattens one batch into one directory).
 
+An agent running **on the cluster** hands files back the same way, but must call
+`~/.local/bin/spush` by absolute path: its Bash tool runs a non-login shell whose
+snapshot predates the `spush` function. `ensureAgentNote()` keeps a marked block
+in the cluster's `~/.claude/CLAUDE.md` saying exactly that, so a Claude Code
+session there discovers the mechanism without being told. `spush -w <secs>` exits
+1 when the file did not arrive, which is the signal an agent should act on —
+usually "ask the user to run `spod recv`", not "retry".
+
 Things that are load-bearing here:
 
 - **The queue is claimed by rename, not truncate.** `ssh()` retries a reset
@@ -196,6 +204,11 @@ Things that are load-bearing here:
   both a `spush` symlink (works in tmux sessions opened before the update) and a
   `spush()` wrapper in the managed bashrc block. `ssh cluster 'spush x'` finds
   neither — use `bash -lc` or the absolute path.
+- **A queued path can rot into a poison entry.** The queue outlives the job that
+  wrote it; a deleted file fails every fetch, gets re-queued, and the watch loop
+  claims it straight back — a spin. `statQueued` re-stats everything before
+  fetching and drops what is gone (with a receipt), and a drain that re-queued
+  anything reports itself unsettled so the loop backs off 30 s.
 - Local claims that have not finished are kept in `/tmp/spod[-hpc4]-recv-inflight`,
   so Ctrl-C mid-transfer re-tries those files instead of losing them; failures
   are re-queued on the cluster.
