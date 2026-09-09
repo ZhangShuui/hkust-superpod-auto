@@ -119,3 +119,101 @@ func TestTargetTmpPathsAreDistinct(t *testing.T) {
 		t.Fatalf("both clusters default to SOCKS port %s", sp.defSocks)
 	}
 }
+
+func TestParsePushLine(t *testing.T) {
+	it, valid := parsePushLine("1700000000\trun7/logs\t4096\t/project/foo/a.bin")
+	if !valid {
+		t.Fatal("valid queue line rejected")
+	}
+	if it.ts != 1700000000 || it.sub != "run7/logs" || it.size != 4096 || it.path != "/project/foo/a.bin" {
+		t.Fatalf("wrong fields: %+v", it)
+	}
+	if it, valid := parsePushLine("1700000000\t-\t0\t/a/b"); !valid || it.sub != "" {
+		t.Fatalf("'-' should mean no subdir, got %+v (valid=%v)", it, valid)
+	}
+	for _, bad := range []string{
+		"",
+		"   ",
+		"1700000000\t-\t0",                // too few fields
+		"1700000000\t-\t0\trelative/path", // not absolute
+		"notanumber\t-\t0\t/a/b",          // bogus timestamp
+		"1700000000\t-\t0\t/a/b\textra",   // too many fields
+	} {
+		if _, valid := parsePushLine(bad); valid {
+			t.Errorf("accepted malformed line %q", bad)
+		}
+	}
+}
+
+// The queue lives in a cluster home that may be shared with other people on the
+// same account, so a subdirectory out of it must never escape the download dir.
+func TestSanitizeSubStaysInsideDest(t *testing.T) {
+	cases := map[string]string{
+		"run7":                "run7",
+		"run7/logs":           "run7/logs",
+		"../../etc":           "etc",
+		"/etc/cron.d":         "etc/cron.d",
+		"a/../../../b":        "a/b",
+		"./x//y":              "x/y",
+		"~":                   "",
+		"":                    "",
+		"a/b/c/d/e/f/g/h/i/j": "a/b/c/d/e/f/g/h", // depth cap
+	}
+	for in, want := range cases {
+		if got := sanitizeSub(in); got != want {
+			t.Errorf("sanitizeSub(%q) = %q, want %q", in, got, want)
+		}
+		if got := sanitizeSub(in); filepath.IsAbs(got) || strings.Contains(got, "..") {
+			t.Errorf("sanitizeSub(%q) = %q escapes dest", in, got)
+		}
+	}
+}
+
+// parallelFetch flattens a batch into one directory, so same-named files have
+// to land in different batches instead of racing into one local file.
+func TestBatchBySubSplitsDuplicateBasenames(t *testing.T) {
+	items := []pushItem{
+		{sub: "", path: "/a/x.bin"},
+		{sub: "", path: "/b/x.bin"},
+		{sub: "run7", path: "/c/y.bin"},
+		{sub: "", path: "/d/z.bin"},
+	}
+	batches := batchBySub(items)
+	if len(batches) != 3 {
+		t.Fatalf("want 3 batches (2 for the duplicate + 1 subdir), got %d: %+v", len(batches), batches)
+	}
+	for _, b := range batches {
+		seen := map[string]bool{}
+		for _, it := range b.items {
+			base := filepath.Base(it.path)
+			if seen[base] {
+				t.Errorf("batch %q holds %q twice", b.sub, base)
+			}
+			seen[base] = true
+		}
+	}
+}
+
+func TestDedupePush(t *testing.T) {
+	items := []pushItem{
+		{sub: "", path: "/a/x", raw: "old"},
+		{sub: "", path: "/a/x", raw: "new"},
+		{sub: "run7", path: "/a/x", raw: "other-dest"},
+	}
+	got := dedupePush(items)
+	if len(got) != 2 {
+		t.Fatalf("want 2 unique (sub,path) pairs, got %d", len(got))
+	}
+	if got[0].raw != "old" {
+		t.Errorf("dedupe should keep the first (inflight) copy, got %q", got[0].raw)
+	}
+}
+
+func TestDisplayPath(t *testing.T) {
+	if got := displayPath("/mnt/c/Users/Win11/Downloads"); got != `C:\Users\Win11\Downloads` {
+		t.Errorf("got %q", got)
+	}
+	if got := displayPath("/home/me/dl"); got != "/home/me/dl" {
+		t.Errorf("non-WSL path should pass through, got %q", got)
+	}
+}

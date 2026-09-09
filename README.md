@@ -22,6 +22,10 @@ spod kill <name>      # 关掉指定会话
 spod killall          # 关掉所有会话
 
 # ── 工具 ──
+spod get <路径>...    # 拉文件到本地（默认 Windows Downloads，MD5 校验 + 断点续传）
+spod recv             # 接收集群上 spush 推来的文件（守着队列）
+spod recv once        # 取一次队列就退出
+spod recv status      # 看队列 / 接收端是否在线
 spod sync <r> <l>     # 从 SuperPod 并行 rsync 到本地
 spod sync stop        # 停止所有 rsync
 spod speed [秒]       # VPN 隧道测速（默认 60s）
@@ -40,6 +44,30 @@ spod hpc4             # 上面的子命令都能加 hpc4 前缀，走 HPC4 集�
 spod hpc4 ls          # 例：列 HPC4 上的会话
 spod hpc4 get <path>  # 例：从 HPC4 拉文件
 ```
+
+### 从集群推文件回本地
+
+集群连不到你这台机器（VPN 分流 + WSL2 在 NAT 后面，唯一的入站口是那条
+systemd 守着、给 claude/codex 用的反向隧道，拿它传大文件会把 relay 饿死）。
+所以推送做成了**队列**：集群上 `spush` 把路径排进 `~/.spod/outbox`，本地
+`spod recv` 认领后用 `spod get` 那条并行通道拉下来（4 路并发、MD5 校验、
+断点续传），默认落到 Windows 的 Downloads。
+
+```bash
+# 本地：守着（Ctrl-C 退出）
+spod recv                         # 或 spod recv -o 'C:\Users\me\Desktop'
+spod hpc4 recv                    # HPC4 的队列，互不干扰
+
+# 集群上（tmux 会话里直接用）
+spush out.mp4                     # 排进队列，本地在跑就立刻被取走
+spush -d run7 results/            # 目录整个推，保留层级到 Downloads/run7/results/
+spush -w ckpt.pt                  # 等本地回执，收到后打印落地路径
+spush -l                          # 看还有什么没被取走
+```
+
+本地没开 `spod recv` 也能推 —— 队列一直留着，下次 `spod recv` 一起取。
+`spush` 由 spod 自动部署（`~/.local/bin/spod-push` + `spush` 软链 + bashrc 包装），
+每次连接会检查版本。
 
 ### 两个集群同时用
 
@@ -153,6 +181,7 @@ spod                  # 重连，tmux 保住了进程
 | VS Code 一键配置 | `spod vscode` 自动配 SSH config、公钥、SOCKS 代理 |
 | SSH 自动重试 | 网络抖动时自动重试 3 次（2s→4s→8s 退避） |
 | 精准代理 | 只有 claude/codex 走隧道代理，git/pip 等直连 |
+| 集群 → 本地推文件 | 集群上 `spush` 排队，本地 `spod recv` 认领并行拉取（集群无法主动连本机） |
 
 ## Windows 接入 SuperPod
 

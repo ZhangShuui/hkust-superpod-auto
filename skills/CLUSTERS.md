@@ -189,6 +189,7 @@ spod vpn status            # one VPN, reports both clusters
 spod            / spod hpc4            # tmux session on either
 spod ssh        / spod hpc4 ssh        # raw SSH, no tmux
 spod get PATH   / spod hpc4 get PATH   # MD5-verified pull to Windows Downloads
+spod recv       / spod hpc4 recv       # receive files pushed from the cluster with `spush`
 spod socks      / spod hpc4 socks      # local :1080 vs :1081
 ```
 

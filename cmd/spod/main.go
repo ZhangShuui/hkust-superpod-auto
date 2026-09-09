@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2325,6 +2326,84 @@ func parallelFetch(files []*remoteFile, dest string, streams int, counter *atomi
 //
 // Transfers fan out over several independent SSH connections — see getStreams
 // and getSSHOpts for why that is worth roughly 3x on this link.
+// fetchAndVerify pulls files into dest over the parallel fetcher and checks
+// each one against an MD5 snapshot taken *before* the transfer (see cmdGet for
+// why the snapshot has to come first). The map it returns holds a per-file
+// verification result — a nil entry means that file arrived intact. A non-nil
+// second return means the transfer itself failed and nothing was verified.
+func fetchAndVerify(files []*remoteFile, dest string) (map[*remoteFile]error, error) {
+	var totalBytes int64
+	for _, f := range files {
+		totalBytes += f.size
+	}
+
+	info(fmt.Sprintf("计算远端 MD5（%d 个文件）...", len(files)))
+	var shellList []string
+	for _, f := range files {
+		shellList = append(shellList, shellQuote(f.path))
+	}
+	want := map[string]string{} // basename → md5
+	if sums, err := ssh("md5sum " + strings.Join(shellList, " ")); err != nil {
+		warn(fmt.Sprintf("远端 MD5 失败，将跳过校验: %v", err))
+	} else {
+		for _, line := range strings.Split(sums, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) >= 2 {
+				want[filepath.Base(strings.Join(f[1:], " "))] = f[0]
+			}
+		}
+	}
+
+	streams := getStreams()
+	info(fmt.Sprintf("下载到 %s（%d 路并行）...", dest, streams))
+
+	var fetched, doneFiles atomic.Int64
+	label := func() string {
+		if len(files) <= 1 {
+			return ""
+		}
+		return fmt.Sprintf("(%d/%d 文件)", doneFiles.Load(), len(files))
+	}
+	stop, barDone := make(chan struct{}), make(chan struct{})
+	go progressBar(fetched.Load, totalBytes, label, stop, barDone)
+	fetchErr := parallelFetch(files, dest, streams, &fetched, &doneFiles)
+	close(stop)
+	<-barDone
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	results := map[*remoteFile]error{}
+	for _, f := range files {
+		local := filepath.Join(dest, f.base)
+		fi, err := os.Stat(local)
+		if err != nil {
+			fail(f.base + " — 本地文件缺失")
+			results[f] = errors.New("本地文件缺失")
+			continue
+		}
+		exp, haveSum := want[f.base]
+		if !haveSum {
+			warn(fmt.Sprintf("%s (%s) — 无远端 MD5，未校验", f.base, humanBytes(fi.Size())))
+			results[f] = nil
+			continue
+		}
+		out, err := exec.Command("md5sum", local).Output()
+		got := ""
+		if err == nil {
+			got = strings.Fields(string(out))[0]
+		}
+		if got == exp {
+			ok(fmt.Sprintf("%s (%s) — MD5 校验通过", f.base, humanBytes(fi.Size())))
+			results[f] = nil
+			continue
+		}
+		fail(fmt.Sprintf("%s — MD5 不匹配（远端 %s / 本地 %s）", f.base, exp, got))
+		results[f] = errors.New("MD5 不匹配")
+	}
+	return results, nil
+}
+
 func cmdGet(args []string) {
 	// Parse: spod get <remote>... [-o <dest>]
 	var remotes []string
@@ -2413,81 +2492,771 @@ func cmdGet(args []string) {
 	}
 	info(fmt.Sprintf("共 %d 个文件, %s", len(files), humanBytes(totalBytes)))
 
-	// Snapshot checksums before pulling — see the comment on cmdGet.
-	info(fmt.Sprintf("计算远端 MD5（%d 个文件）...", len(files)))
-	var shellList []string
-	for _, f := range files {
-		shellList = append(shellList, shellQuote(f.path))
-	}
-	sums, err := ssh("md5sum " + strings.Join(shellList, " "))
-	want := map[string]string{} // basename → md5
-	if err != nil {
-		warn(fmt.Sprintf("远端 MD5 失败，将跳过校验: %v", err))
-	} else {
-		for _, line := range strings.Split(sums, "\n") {
-			f := strings.Fields(strings.TrimSpace(line))
-			if len(f) >= 2 {
-				want[filepath.Base(strings.Join(f[1:], " "))] = f[0]
-			}
-		}
-	}
-
-	streams := getStreams()
-	info(fmt.Sprintf("下载到 %s（%d 路并行）...", dest, streams))
-
-	var fetched, doneFiles atomic.Int64
-	label := func() string {
-		if len(files) <= 1 {
-			return ""
-		}
-		return fmt.Sprintf("(%d/%d 文件)", doneFiles.Load(), len(files))
-	}
-	stop, barDone := make(chan struct{}), make(chan struct{})
-	go progressBar(fetched.Load, totalBytes, label, stop, barDone)
-	fetchErr := parallelFetch(files, dest, streams, &fetched, &doneFiles)
-	close(stop)
-	<-barDone
-
+	results, fetchErr := fetchAndVerify(files, dest)
 	if fetchErr != nil {
 		fail(fmt.Sprintf("下载失败: %v", fetchErr))
 		info("已传输的部分会保留，重跑同一条命令可断点续传")
 		os.Exit(1)
 	}
 
-	// Verify.
 	bad := 0
-	for _, f := range files {
-		base := f.base
-		local := filepath.Join(dest, base)
-		fi, err := os.Stat(local)
-		if err != nil {
-			fail(base + " — 本地文件缺失")
-			bad++
-			continue
-		}
-		exp, haveSum := want[base]
-		if !haveSum {
-			warn(fmt.Sprintf("%s (%s) — 无远端 MD5，未校验", base, humanBytes(fi.Size())))
-			continue
-		}
-		out, err := exec.Command("md5sum", local).Output()
-		got := ""
-		if err == nil {
-			got = strings.Fields(string(out))[0]
-		}
-		if got == exp {
-			ok(fmt.Sprintf("%s (%s) — MD5 校验通过", base, humanBytes(fi.Size())))
-		} else {
-			fail(fmt.Sprintf("%s — MD5 不匹配（远端 %s / 本地 %s）", base, exp, got))
+	for _, r := range results {
+		if r != nil {
 			bad++
 		}
 	}
-
 	if bad > 0 {
 		fail(fmt.Sprintf("%d 个文件校验未通过 — 重跑同一条命令可续传/重取", bad))
 		os.Exit(1)
 	}
 	ok(fmt.Sprintf("全部完成 → %s", dest))
+}
+
+// ── Recv: files pushed from the cluster ──
+//
+// The cluster cannot open a connection to this machine. The VPN is
+// split-tunnel and WSL2 sits behind NAT, so the only inbound path that exists
+// at all is the reverse tunnel — and that one is owned by systemd and carries
+// the API traffic claude/codex depend on, which a bulk upload would starve.
+//
+// So a push is a queue, not a connection: `spush` on the cluster appends the
+// file's path to ~/.spod/outbox, and `spod recv` here claims the queue and
+// pulls those files down the same path as `spod get` (parallel streams,
+// MD5-verified, resumable). Nothing new has to listen anywhere, both clusters
+// work identically, and a push made while this machine is asleep simply waits
+// in the queue until the next `spod recv`.
+
+// pushHelperVersion identifies the deployed copy of pushHelperScript. It is the
+// script's own content hash rather than a hand-maintained number: the installer
+// only rewrites the file when the marker differs, so a bump that someone forgot
+// leaves a stale helper on the cluster with no sign of it.
+func pushHelperVersion() string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(pushHelperScript)))[:12]
+}
+
+const pushHelperScript = `#!/bin/bash
+# spod-push — 把集群上的文件排进队列，等本地的 spod recv 取走。
+# 由 spod 自动部署（cmd/spod/main.go: pushHelperScript），手改会在下次连接时被覆盖。
+set -u
+
+SPOD_DIR="$HOME/.spod"
+OUTBOX="$SPOD_DIR/outbox"
+LOCK="$SPOD_DIR/outbox.lock"
+RECEIPTS="$SPOD_DIR/receipts"
+ALIVE="$SPOD_DIR/recv-alive"
+TAB=$(printf '\t')
+
+c_red=$(printf '\033[31m'); c_grn=$(printf '\033[32m'); c_blu=$(printf '\033[34m')
+c_amb=$(printf '\033[33m'); c_gry=$(printf '\033[90m'); c_off=$(printf '\033[0m')
+say()  { printf '  %s>%s %s\n' "$c_blu" "$c_off" "$*" >&2; }
+yay()  { printf '  %s+%s %s\n' "$c_grn" "$c_off" "$*" >&2; }
+oops() { printf '  %s!%s %s\n' "$c_amb" "$c_off" "$*" >&2; }
+die()  { printf '  %sx%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+human() {
+    awk -v b="$1" 'BEGIN{split("B KB MB GB TB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++};
+        if(i==1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]}'
+}
+
+usage() {
+    cat >&2 <<'USAGE_EOF'
+  用法: spush [-d 子目录] [-w [秒]] <文件或目录>...
+        spush -l          看队列
+        spush -c          清空队列
+
+  文件不是直接推过去的：集群连不到你的机器，只有本地能主动发起连接。
+  spush 把路径排进 ~/.spod/outbox，本地的 spod recv 认领后并行拉走
+  （4 路并发 + MD5 校验 + 断点续传），默认落到 Windows 的 Downloads。
+
+    -d DIR    放进本地下载目录下的子目录
+    -w [秒]   等本地确认收到（默认 600 秒；Ctrl-C 走开也不影响传输）
+    -l        列出还没被取走的条目
+    -c        清空队列
+USAGE_EOF
+}
+
+mkdir -p "$SPOD_DIR" 2>/dev/null || die "创建 $SPOD_DIR 失败"
+
+sub=""; wait_secs=0; mode="push"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--dir)   shift; [ $# -gt 0 ] || die "-d 需要一个子目录名"; sub="$1"; shift ;;
+        -w|--wait)  shift; wait_secs=600
+                    case "${1:-}" in
+                        ''|-*)      ;;
+                        *[!0-9]*)   ;;
+                        *) wait_secs="$1"; shift ;;
+                    esac ;;
+        -l|--list)  mode="list";  shift ;;
+        -c|--clear) mode="clear"; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; break ;;
+        -*)         die "未知参数: $1（spush -h 看用法）" ;;
+        *)          break ;;
+    esac
+done
+
+if [ "$mode" = "list" ]; then
+    [ -s "$OUTBOX" ] || { say "队列是空的"; exit 0; }
+    awk -F'\t' -v g="$c_gry" -v o="$c_off" '
+        {n++; t+=$3; d=($2=="-" ? "" : "  ->  " $2 "/"); printf "    %s%s%s%s\n", g, $4, d, o}
+        END{printf "  %d 个文件在队列里\n", n}' "$OUTBOX" >&2
+    exit 0
+fi
+
+if [ "$mode" = "clear" ]; then
+    n=$(wc -l < "$OUTBOX" 2>/dev/null || echo 0)
+    ( flock -w 10 9 2>/dev/null; : > "$OUTBOX"; rm -f "$SPOD_DIR"/claim.* ) 9>>"$LOCK"
+    yay "已清空队列（$n 条）"
+    exit 0
+fi
+
+[ $# -gt 0 ] || { usage; exit 1; }
+
+now=$(date +%s)
+TMPQ=$(mktemp "${TMPDIR:-/tmp}/spod-push.XXXXXX") || die "mktemp 失败"
+trap 'rm -f "$TMPQ"' EXIT
+n=0; total=0
+
+add_file() {  # $1 绝对路径, $2 目标子目录（可空）
+    f="$1"; s="${2:-}"
+    case "$f$s" in
+        *"$TAB"*) oops "跳过（路径含制表符）: $f"; return ;;
+    esac
+    [ -f "$f" ] || { oops "跳过（不是普通文件）: $f"; return; }
+    [ -r "$f" ] || { oops "跳过（读不了）: $f"; return; }
+    sz=$(stat -Lc %s "$f" 2>/dev/null) || sz=0
+    printf '%s\t%s\t%s\t%s\n' "$now" "${s:--}" "$sz" "$f" >> "$TMPQ"
+    n=$((n + 1)); total=$((total + sz))
+}
+
+add_path() {
+    p="$1"
+    [ -e "$p" ] || { oops "跳过（不存在）: $p"; return; }
+    abs=$(readlink -f "$p" 2>/dev/null) || abs="$p"
+    case "$abs" in
+        *"$TAB"*) oops "跳过（路径含制表符）: $p"; return ;;
+    esac
+    if [ -d "$abs" ]; then
+        base=$(basename "$abs")
+        while IFS= read -r f; do
+            rel=${f#"$abs"/}
+            dir=$(dirname "$rel")
+            target="$base"
+            [ "$dir" != "." ] && target="$base/$dir"
+            [ -n "$sub" ] && target="$sub/$target"
+            add_file "$f" "$target"
+        done < <(find "$abs" -type f -print 2>/dev/null)
+    else
+        add_file "$abs" "$sub"
+    fi
+}
+
+for p in "$@"; do add_path "$p"; done
+[ "$n" -gt 0 ] || die "没有可排队的文件"
+
+( flock -w 10 9 2>/dev/null; cat "$TMPQ" >> "$OUTBOX" ) 9>>"$LOCK"
+yay "已排队 $n 个文件（$(human $total)）"
+
+alive=""
+if [ -f "$ALIVE" ]; then
+    age=$(( now - $(stat -c %Y "$ALIVE" 2>/dev/null || echo 0) ))
+    [ "$age" -ge 0 ] && [ "$age" -lt 180 ] && alive=1
+fi
+if [ -n "$alive" ]; then
+    say "本地接收端在线，马上就会开始拉"
+else
+    say "本地接收端没在跑 — 在本地执行 spod recv 就会取走（队列一直留着）"
+fi
+
+[ "$wait_secs" -gt 0 ] || exit 0
+
+say "等本地确认收到（最多 ${wait_secs}s；Ctrl-C 走开不影响传输）..."
+deadline=$((now + wait_secs))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    pending=0
+    while IFS= read -r line; do
+        path=$(printf '%s' "$line" | cut -f4)
+        got=$(awk -F'\t' -v t="$now" -v p="$path" '$1+0>=t && $3==p {s=$2} END{print s}' "$RECEIPTS" 2>/dev/null)
+        [ -z "$got" ] && pending=$((pending + 1))
+    done < "$TMPQ"
+    [ "$pending" -eq 0 ] && break
+    sleep 3
+done
+
+rc=0
+while IFS= read -r line; do
+    path=$(printf '%s' "$line" | cut -f4)
+    res=$(awk -F'\t' -v t="$now" -v p="$path" '$1+0>=t && $3==p {s=$2; d=$4} END{printf "%s\t%s", s, d}' "$RECEIPTS" 2>/dev/null)
+    st=$(printf '%s' "$res" | cut -f1); dst=$(printf '%s' "$res" | cut -f2)
+    case "$st" in
+        ok)   yay "$(basename "$path")  ->  $dst" ;;
+        fail) oops "$(basename "$path") 本地拉取失败（已重新排队，会再试）"; rc=1 ;;
+        *)    oops "$(basename "$path") 还没被取走 — 队列保留，本地 spod recv 起来后会继续"; rc=1 ;;
+    esac
+done < "$TMPQ"
+exit $rc
+`
+
+// pushItem is one queued file as the cluster recorded it.
+type pushItem struct {
+	ts   int64  // queued at (cluster clock)
+	sub  string // sanitized destination subdirectory under dest, "" for none
+	size int64  // size at queue time — informational; the fetcher re-stats
+	path string // absolute path on the cluster
+	raw  string // the queue line verbatim, so a failure can be re-queued as-is
+}
+
+// parsePushLine decodes one outbox line: ts \t sub \t size \t abspath.
+func parsePushLine(line string) (pushItem, bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if strings.TrimSpace(line) == "" {
+		return pushItem{}, false
+	}
+	f := strings.Split(line, "\t")
+	if len(f) != 4 || !strings.HasPrefix(f[3], "/") {
+		return pushItem{}, false
+	}
+	ts, err := strconv.ParseInt(f[0], 10, 64)
+	if err != nil {
+		return pushItem{}, false
+	}
+	size, _ := strconv.ParseInt(f[2], 10, 64)
+	sub := ""
+	if f[1] != "-" {
+		sub = sanitizeSub(f[1])
+	}
+	return pushItem{ts: ts, sub: sub, size: size, path: f[3], raw: line}, true
+}
+
+// sanitizeSub keeps a queued destination subdirectory inside the download
+// directory. The queue lives in a cluster home that may be shared with other
+// people on the same account, so ".." — or an absolute path — must not be able
+// to steer a write anywhere else on this machine.
+func sanitizeSub(s string) string {
+	var out []string
+	for _, part := range strings.Split(filepath.ToSlash(s), "/") {
+		switch part {
+		case "", ".", "..", "~":
+			continue
+		}
+		out = append(out, part)
+		if len(out) == 8 { // depth cap: a queue line can't grow a deep tree here
+			break
+		}
+	}
+	return filepath.Join(out...)
+}
+
+// wslMntRe matches /mnt/c/... so a destination can be echoed back to the
+// cluster in the form the user will actually type into Windows Explorer.
+var wslMntRe = regexp.MustCompile(`^/mnt/([a-z])/(.*)$`)
+
+func displayPath(p string) string {
+	m := wslMntRe.FindStringSubmatch(p)
+	if m == nil {
+		return p
+	}
+	return strings.ToUpper(m[1]) + `:\` + strings.ReplaceAll(m[2], "/", `\`)
+}
+
+// ensurePushHelper deploys ~/.local/bin/spod-push on the cluster, skipping the
+// write when the version marker already matches. ~/.local/bin is not on the
+// non-interactive PATH there, which is why the bashrc block wraps it as
+// `spush` with an absolute path rather than relying on PATH.
+func ensurePushHelper() {
+	installer := fmt.Sprintf(`mkdir -p ~/.local/bin ~/.spod
+# ~/.local/bin IS on the login-shell PATH (it is missing only from the
+# non-interactive one), so the symlink makes spush work in tmux sessions that
+# were opened before the bashrc wrapper was written.
+ln -sfn ~/.local/bin/spod-push ~/.local/bin/spush
+have=$(sed -n 's/^# spod-push-version: //p' ~/.local/bin/spod-push 2>/dev/null | head -1)
+if [ "$have" = "%s" ]; then echo UPTODATE; exit 0; fi
+cat > ~/.local/bin/spod-push.new << 'SPOD_PUSH_EOF'
+%s
+# spod-push-version: %s
+SPOD_PUSH_EOF
+chmod 755 ~/.local/bin/spod-push.new && mv -f ~/.local/bin/spod-push.new ~/.local/bin/spod-push && echo INSTALLED`,
+		pushHelperVersion(), pushHelperScript, pushHelperVersion())
+	out, err := ssh(installer)
+	if err != nil {
+		warn(fmt.Sprintf("spush 助手部署失败: %v", err))
+		return
+	}
+	if strings.Contains(out, "INSTALLED") {
+		ok(fmt.Sprintf("已在 %s 上安装 spush（推文件回本地）", tgt.label))
+	}
+}
+
+// claimQueue takes ownership of everything queued on the cluster.
+//
+// The outbox is *renamed* under flock rather than truncated: ssh() retries a
+// reset connection, and a truncate that succeeded remotely but whose output
+// never made it back would silently drop every queued path. A claim file
+// survives that, and any left behind by an earlier interrupted run is picked
+// up by the next claim.
+func claimQueue() ([]pushItem, []string, error) {
+	out, err := ssh(`mkdir -p ~/.spod
+cd ~/.spod || exit 1
+: >> outbox
+exec 9>>outbox.lock
+flock -w 10 9 2>/dev/null
+[ -s outbox ] && mv -f outbox "claim.$$.$(date +%s)"
+touch outbox
+flock -u 9 2>/dev/null
+for c in claim.*; do
+    [ -e "$c" ] || continue
+    printf 'CLAIM\t%s\n' "$c"
+    cat "$c"
+done`)
+	if err != nil {
+		return nil, nil, err
+	}
+	var items []pushItem
+	var claims []string
+	for _, line := range strings.Split(out, "\n") {
+		if name, isClaim := strings.CutPrefix(line, "CLAIM\t"); isClaim {
+			claims = append(claims, strings.TrimSpace(name))
+			continue
+		}
+		if it, valid := parsePushLine(line); valid {
+			items = append(items, it)
+		}
+	}
+	return items, claims, nil
+}
+
+// dropClaims deletes claim files once their contents are safely recorded in the
+// local inflight file, and reports whether the cluster is now clean.
+//
+// This has to actually work: a claim file left behind is picked up by the next
+// claim, so a silently-failing delete turns the watch loop into an endless
+// re-download of the same files. Names are passed relative to ~/.spod — they go
+// through shellQuote, which single-quotes, so a "$HOME/..." prefix would never
+// be expanded.
+func dropClaims(claims []string) bool {
+	if len(claims) == 0 {
+		return true
+	}
+	var q []string
+	for _, c := range claims {
+		if strings.ContainsAny(c, "/ \t") || !strings.HasPrefix(c, "claim.") {
+			continue // only ever remove names this code produced
+		}
+		q = append(q, shellQuote(c))
+	}
+	if len(q) == 0 {
+		return true
+	}
+	out, err := ssh("cd ~/.spod && rm -f " + strings.Join(q, " ") + "; ls claim.* 2>/dev/null | wc -l")
+	if err != nil {
+		warn(fmt.Sprintf("清理队列文件失败: %v", err))
+		return false
+	}
+	if strings.TrimSpace(out) != "0" {
+		warn(fmt.Sprintf("集群上还留着 %s 个队列文件，手动清: ssh %s 'rm ~/.spod/claim.*'", strings.TrimSpace(out), host))
+		return false
+	}
+	return true
+}
+
+// requeue puts lines back on the cluster's outbox after a failed pull, so the
+// next drain (or the next machine) retries them instead of losing them.
+func requeue(items []pushItem) {
+	if len(items) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("mkdir -p ~/.spod\n( flock -w 10 9 2>/dev/null; cat >> ~/.spod/outbox ) 9>>~/.spod/outbox.lock << 'SPOD_REQ_EOF'\n")
+	for _, it := range items {
+		b.WriteString(it.raw + "\n")
+	}
+	b.WriteString("SPOD_REQ_EOF\n")
+	if _, err := ssh(b.String()); err != nil {
+		warn(fmt.Sprintf("重新排队失败（%d 条）: %v", len(items), err))
+	}
+}
+
+type receipt struct {
+	status string // "ok" | "fail"
+	path   string // the cluster-side path, as queued
+	dest   string // where it landed locally, in Windows form when applicable
+}
+
+// writeReceipts reports back what arrived, so `spush -w` can say "delivered"
+// and print the local path. Receipts are trimmed to the last 200 lines.
+func writeReceipts(rs []receipt) {
+	if len(rs) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("mkdir -p ~/.spod\ncat >> ~/.spod/receipts << 'SPOD_RCPT_EOF'\n")
+	now := time.Now().Unix()
+	for _, r := range rs {
+		fmt.Fprintf(&b, "%d\t%s\t%s\t%s\n", now, r.status, r.path, r.dest)
+	}
+	b.WriteString("SPOD_RCPT_EOF\ntail -n 200 ~/.spod/receipts > ~/.spod/receipts.tmp && mv -f ~/.spod/receipts.tmp ~/.spod/receipts\n")
+	if _, err := ssh(b.String()); err != nil {
+		warn(fmt.Sprintf("回执写入失败: %v", err))
+	}
+}
+
+// inflightPath records what this machine claimed but has not finished pulling,
+// so a Ctrl-C or a crash re-tries those files instead of dropping them (the
+// cluster's copy of those lines is already gone by then).
+func inflightPath() string { return tgt.tmp("recv-inflight") }
+
+func loadInflight() []pushItem {
+	b, err := os.ReadFile(inflightPath())
+	if err != nil {
+		return nil
+	}
+	var items []pushItem
+	for _, line := range strings.Split(string(b), "\n") {
+		if it, valid := parsePushLine(line); valid {
+			items = append(items, it)
+		}
+	}
+	return items
+}
+
+func saveInflight(items []pushItem) {
+	if len(items) == 0 {
+		os.Remove(inflightPath())
+		return
+	}
+	var b strings.Builder
+	for _, it := range items {
+		b.WriteString(it.raw + "\n")
+	}
+	os.WriteFile(inflightPath(), []byte(b.String()), 0600)
+}
+
+// dedupePush collapses repeats of the same (subdir, path) — an entry recovered
+// from inflight is usually also the one just claimed.
+func dedupePush(items []pushItem) []pushItem {
+	seen := map[string]bool{}
+	var out []pushItem
+	for _, it := range items {
+		k := it.sub + "\x00" + it.path
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, it)
+	}
+	return out
+}
+
+// pushBatch is one parallelFetch call's worth of queued files: same
+// destination subdirectory, no two files sharing a basename.
+type pushBatch struct {
+	sub   string
+	items []pushItem
+}
+
+// batchBySub groups queued files into fetch batches. parallelFetch flattens
+// everything into one directory, so a batch may hold each basename only once —
+// same-named files from different directories go into later batches instead of
+// racing each other's chunks into one local file (cmdGet refuses that case; a
+// queue can't ask the user, so it serializes instead).
+func batchBySub(items []pushItem) []pushBatch {
+	var order []string
+	bySub := map[string][]pushItem{}
+	for _, it := range items {
+		if _, seen := bySub[it.sub]; !seen {
+			order = append(order, it.sub)
+		}
+		bySub[it.sub] = append(bySub[it.sub], it)
+	}
+	var out []pushBatch
+	for _, sub := range order {
+		for len(bySub[sub]) > 0 {
+			var batch, rest []pushItem
+			taken := map[string]bool{}
+			for _, it := range bySub[sub] {
+				base := filepath.Base(it.path)
+				if taken[base] {
+					rest = append(rest, it)
+					continue
+				}
+				taken[base] = true
+				batch = append(batch, it)
+			}
+			out = append(out, pushBatch{sub, batch})
+			bySub[sub] = rest
+		}
+	}
+	return out
+}
+
+// drainOnce claims the cluster's queue and pulls everything in it. It returns
+// how many files landed and verified, and whether the claim was cleaned up —
+// a false there means the same files would be claimed again, so the caller
+// must back off instead of looping straight back in.
+func drainOnce(dest string) (int, bool) {
+	claimed, claims, err := claimQueue()
+	if err != nil {
+		warn(fmt.Sprintf("读取 %s 队列失败: %v", tgt.label, err))
+		return 0, false
+	}
+	items := dedupePush(append(loadInflight(), claimed...))
+	if len(items) == 0 {
+		return 0, dropClaims(claims)
+	}
+	// Record before deleting the cluster's copy — this file is the only record
+	// of the claim from here on.
+	saveInflight(items)
+	clean := dropClaims(claims)
+
+	var totalBytes int64
+	for _, it := range items {
+		totalBytes += it.size
+	}
+	info(fmt.Sprintf("收到 %d 个文件（%s）", len(items), humanBytes(totalBytes)))
+
+	var receipts []receipt
+	var failed []pushItem
+	done := 0
+
+	for _, batch := range batchBySub(items) {
+		outDir := filepath.Join(dest, batch.sub)
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			fail(fmt.Sprintf("创建目录失败: %v", err))
+			failed = append(failed, batch.items...)
+			continue
+		}
+		files := make([]*remoteFile, 0, len(batch.items))
+		owner := map[*remoteFile]pushItem{}
+		for _, it := range batch.items {
+			rf := &remoteFile{path: it.path, base: filepath.Base(it.path), size: it.size}
+			files = append(files, rf)
+			owner[rf] = it
+		}
+		results, batchErr := fetchAndVerify(files, outDir)
+		for _, rf := range files {
+			it := owner[rf]
+			if batchErr != nil {
+				failed = append(failed, it)
+				receipts = append(receipts, receipt{"fail", it.path, ""})
+				continue
+			}
+			if results[rf] != nil {
+				failed = append(failed, it)
+				receipts = append(receipts, receipt{"fail", it.path, displayPath(filepath.Join(outDir, rf.base))})
+				continue
+			}
+			done++
+			receipts = append(receipts, receipt{"ok", it.path, displayPath(filepath.Join(outDir, rf.base))})
+		}
+		if batchErr != nil {
+			fail(fmt.Sprintf("拉取失败: %v", batchErr))
+			info("已传输的部分保留，重新排队后会断点续传")
+		}
+	}
+
+	saveInflight(nil)
+	requeue(failed)
+	writeReceipts(receipts)
+	if done > 0 {
+		ok(fmt.Sprintf("已收下 %d 个文件 → %s", done, displayPath(dest)))
+	}
+	return done, clean
+}
+
+// waitForPush blocks on the cluster until something is queued, touching the
+// heartbeat the push helper reads so `spush` can tell the user whether anyone
+// is listening. Returns true when there is work; false on timeout or error.
+func waitForPush() bool {
+	out, err := ssh(`mkdir -p ~/.spod
+for i in $(seq 1 60); do
+    touch ~/.spod/recv-alive 2>/dev/null
+    [ -s ~/.spod/outbox ] && { echo READY; exit 0; }
+    ls ~/.spod/claim.* >/dev/null 2>&1 && { echo READY; exit 0; }
+    sleep 3
+done
+echo IDLE`)
+	if err != nil {
+		if !vpnTunnelUp() {
+			warn("VPN 断了，等它回来...")
+		} else {
+			warn(fmt.Sprintf("等待队列时 SSH 出错: %v", err))
+		}
+		return false
+	}
+	return strings.Contains(out, "READY")
+}
+
+// heartbeat keeps ~/.spod/recv-alive fresh during a long transfer, when no
+// waitForPush call is running to touch it.
+func heartbeat(stop <-chan struct{}) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			ssh("mkdir -p ~/.spod && touch ~/.spod/recv-alive")
+		}
+	}
+}
+
+func cmdRecvStatus() {
+	out, err := ssh(`mkdir -p ~/.spod
+n=0; total=0
+if [ -s ~/.spod/outbox ]; then
+    n=$(wc -l < ~/.spod/outbox)
+    total=$(awk -F'\t' '{s+=$3} END{print s+0}' ~/.spod/outbox)
+fi
+echo "QUEUE $n $total"
+if [ -f ~/.spod/recv-alive ]; then
+    echo "ALIVE $(( $(date +%s) - $(stat -c %Y ~/.spod/recv-alive) ))"
+else
+    echo "ALIVE -1"
+fi
+echo RECENT
+tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
+	if err != nil {
+		fail(fmt.Sprintf("查询 %s 队列失败: %v", tgt.label, err))
+		os.Exit(1)
+	}
+	inRecent := false
+	var recent []string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "QUEUE "):
+			var n int
+			var total int64
+			fmt.Sscanf(line, "QUEUE %d %d", &n, &total)
+			if n == 0 {
+				info("队列: 空")
+			} else {
+				ok(fmt.Sprintf("队列: %d 个文件待取（%s）", n, humanBytes(total)))
+			}
+		case strings.HasPrefix(line, "ALIVE "):
+			var age int64
+			fmt.Sscanf(line, "ALIVE %d", &age)
+			switch {
+			case age < 0:
+				warn("接收端: 从来没连上过（本地跑 " + spodCmd() + " recv）")
+			case age < 180:
+				ok(fmt.Sprintf("接收端: 在线（%d 秒前）", age))
+			default:
+				warn(fmt.Sprintf("接收端: 已离线 %s", humanDuration(time.Duration(age)*time.Second)))
+			}
+		case line == "RECENT":
+			inRecent = true
+		case inRecent && strings.TrimSpace(line) != "":
+			recent = append(recent, line)
+		}
+	}
+	if len(recent) > 0 {
+		info("最近送达:")
+		for _, r := range recent {
+			f := strings.Split(r, "\t")
+			if len(f) != 4 {
+				continue
+			}
+			mark := "✓"
+			if f[1] != "ok" {
+				mark = "✗"
+			}
+			fmt.Fprintf(os.Stderr, "    %s%s %s → %s%s\n", cGray, mark, filepath.Base(f[2]), f[3], reset)
+		}
+	}
+	if n := len(loadInflight()); n > 0 {
+		warn(fmt.Sprintf("本机还有 %d 条认领后没传完的，下次 %s recv 会续传", n, spodCmd()))
+	}
+}
+
+func cmdRecvClear() {
+	out, err := ssh(`mkdir -p ~/.spod
+exec 9>>~/.spod/outbox.lock
+flock -w 10 9 2>/dev/null
+n=$(wc -l < ~/.spod/outbox 2>/dev/null || echo 0)
+: > ~/.spod/outbox
+rm -f ~/.spod/claim.*
+echo "$n"`)
+	if err != nil {
+		fail(fmt.Sprintf("清空队列失败: %v", err))
+		os.Exit(1)
+	}
+	os.Remove(inflightPath())
+	ok(fmt.Sprintf("已清空 %s 的队列（%s 条）", tgt.label, strings.TrimSpace(out)))
+}
+
+func cmdRecv(args []string) {
+	mode, dest := "watch", ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o", "--out":
+			if i+1 >= len(args) {
+				fail("-o 需要一个目标目录")
+				os.Exit(1)
+			}
+			dest = args[i+1]
+			i++
+		case "once", "one":
+			mode = "once"
+		case "status":
+			mode = "status"
+		case "clear":
+			mode = "clear"
+		case "-h", "--help":
+			info(fmt.Sprintf("用法: %s recv [once|status|clear] [-o <本地目录>]", spodCmd()))
+			info(fmt.Sprintf("在 %s 上用 spush <文件> 推送，这里负责取回", tgt.label))
+			return
+		default:
+			fail(fmt.Sprintf("未知参数: %s", args[i]))
+			info(fmt.Sprintf("用法: %s recv [once|status|clear] [-o <本地目录>]", spodCmd()))
+			os.Exit(1)
+		}
+	}
+
+	ensureVPN()
+	if mode == "status" {
+		cmdRecvStatus()
+		return
+	}
+	if mode == "clear" {
+		cmdRecvClear()
+		return
+	}
+
+	if dest == "" {
+		dest = defaultDownloadDir()
+	}
+	dest = toWSLPath(dest)
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		fail(fmt.Sprintf("创建目录失败: %v", err))
+		os.Exit(1)
+	}
+	ensurePushHelper()
+
+	if mode == "once" {
+		if n, _ := drainOnce(dest); n == 0 {
+			info("队列是空的")
+		}
+		return
+	}
+
+	ok(fmt.Sprintf("接收中：%s 上 spush 推来的文件 → %s", tgt.label, displayPath(dest)))
+	info(fmt.Sprintf("在 %s 上执行 spush <文件>（-w 可等回执），Ctrl-C 退出", tgt.label))
+	stop := make(chan struct{})
+	defer close(stop)
+	go heartbeat(stop)
+	for {
+		n, clean := drainOnce(dest)
+		switch {
+		case !clean:
+			// Something is still claimed on the cluster; re-claiming it
+			// immediately would re-download the same files in a tight loop.
+			time.Sleep(30 * time.Second)
+		case n == 0 && !waitForPush():
+			time.Sleep(5 * time.Second)
+		}
+	}
 }
 
 // ── Speedtest ──
@@ -2669,7 +3438,7 @@ func ensureTmuxConfAndProxy(useRelay bool) {
 	endMarker := "# spod-proxy-end"
 	script := fmt.Sprintf(
 		`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf
-sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^spush()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
 cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
@@ -2679,6 +3448,9 @@ _spod_proxy="http://127.0.0.1:%s"
 # a shared .credentials.json breaks because refresh tokens are single-use (first machine to refresh wins)
 claude() { local _tok=0; if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -r "$HOME/.claude/oauth_token" ]; then export CLAUDE_CODE_OAUTH_TOKEN="$(<"$HOME/.claude/oauth_token")"; _tok=1; fi; export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; [ "$_tok" = 1 ] && unset CLAUDE_CODE_OAUTH_TOKEN; return $rc; }
 codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command codex "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+# spod: push files back to the local machine (queued here, pulled by 'spod recv' there).
+# ~/.local/bin is not on the non-interactive PATH, so call it by absolute path.
+spush() { "$HOME/.local/bin/spod-push" "$@"; }
 %s
 SPOD_EOF`,
 		beginMarker, proxyPort, endMarker,
@@ -2871,6 +3643,7 @@ func ensureRemoteSetup() {
 		relayOK = ensureRelay()
 	}
 	ensureTmuxConfAndProxy(relayOK)
+	ensurePushHelper()
 	ensureRemoteCLIs()
 }
 
@@ -3197,6 +3970,9 @@ func cmdHelp() {
 		{"spod socks status", "查看 SOCKS5 代理状态"},
 		{"spod vscode", "配置 Windows VS Code Remote-SSH"},
 		{"spod get <路径>...", "拉文件到本地（默认 Windows Downloads，带 MD5 校验）"},
+		{"spod recv", "接收集群上 spush 推来的文件（守着队列，Ctrl-C 退出）"},
+		{"spod recv once", "把队列里的文件取一次就退出"},
+		{"spod recv status", "看队列 / 接收端在线状态"},
 		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
@@ -3208,6 +3984,16 @@ func cmdHelp() {
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
+	}
+	fmt.Fprintf(os.Stderr, "\n  %s集群 → 本地推文件%s\n", bold, reset)
+	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
+	for _, l := range []string{
+		"集群连不到本机，所以推送 = 排队 + 本地拉取（走 spod get 那条并行通道）：",
+		"  本地：spod recv                    守着，推一个取一个",
+		"  集群：spush out.mp4                排进队列",
+		"  集群：spush -d run7 -w ckpt/*.pt   放进子目录，并等回执",
+	} {
+		fmt.Fprintf(os.Stderr, "    %s%s%s\n", cGray, l, reset)
 	}
 	fmt.Fprintf(os.Stderr, "\n  %sHPC4%s\n", bold, reset)
 	fmt.Fprintf(os.Stderr, "  %s────────────────────────────────────%s\n", cGray, reset)
@@ -3322,6 +4108,15 @@ func dispatch(args []string) {
 		}
 	case "get":
 		cmdGet(args[1:])
+	case "recv":
+		cmdRecv(args[1:])
+	case "push":
+		// Pushing happens ON the cluster — this is the mistake people make
+		// first, so say where the command actually lives.
+		fail("推送是在集群上发起的，不是这里")
+		info(fmt.Sprintf("在 %s 上: spush <文件>...（%s recv 在本地取回）", tgt.label, spodCmd()))
+		info(fmt.Sprintf("本地往集群传文件用: scp <文件> %s:<路径>", host))
+		os.Exit(1)
 	case "speed":
 		dur := ""
 		if len(args) > 1 {

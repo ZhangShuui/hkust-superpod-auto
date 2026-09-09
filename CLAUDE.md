@@ -53,6 +53,7 @@ Local WSL2
   ├─ spod vpn → hkust-vpn.py → openconnect + vpn-slice → HKUST network
   ├─ Clash (:7890) ◄── autossh reverse tunnel ◄── SuperPod (:per-user tunnel)
   ├─ spod socks → autossh -D 0.0.0.0:1080 → SOCKS5 代理 → Windows 可用
+  ├─ spod recv ◄── ~/.spod/outbox queue ◄── `spush` on the cluster (pull, not push)
   └─ spod → SSH + tmux → SuperPod → Claude Code (→ :relay → :tunnel → Clash → Anthropic API)
                                     → Codex     (→ :relay → :tunnel → Clash → OpenAI API)
 
@@ -75,6 +76,9 @@ spod socks          # Start SOCKS5 proxy for Windows access
 spod socks status   # Check SOCKS5 proxy status
 spod socks stop     # Stop SOCKS5 proxy
 spod get <path>...  # Pull files to Windows Downloads (glob OK, MD5-verified, resumable)
+spod recv           # Receive files pushed from the cluster with `spush` (watch queue)
+spod recv once      # Drain the queue once and exit
+spod recv status    # Queue depth + whether a receiver is online
 
 spod hpc4           # Same commands against HPC4 — see below
 ```
@@ -138,6 +142,63 @@ claimed parallel streams *lowered* throughput; that measurement was run through
 the shared mux and was measuring exactly this collapse, not a link ceiling.
 `getSSHOpts()` gives each worker a private socket, reused across all of its
 chunks so a big file costs 4 logins, not one per chunk.
+
+### Pushing files back: `spush` on the cluster → `spod recv` here
+
+The cluster cannot open a connection to this machine. The VPN is split-tunnel
+and WSL2 sits behind NAT, so the only inbound path that exists at all is the
+reverse tunnel — and that one is systemd-managed and carries the API traffic
+claude/codex ride on, which a bulk upload would starve. Reverse-`ssh`-ing into
+the local box was the other option and is worse: it needs a second `-R` in a
+unit file outside this repo, a local sshd, and a passwordless key *into your
+laptop* sitting on a cluster account other people share.
+
+So a push is a queue, not a connection:
+
+```bash
+# on the cluster (inside tmux, or any login shell)
+spush out.mp4                  # queue it
+spush -d run7 results/         # a whole directory, tree preserved under Downloads/run7/
+spush -w ckpt.pt               # block until the local side confirms, prints where it landed
+spush -l                       # what is still queued
+
+# locally
+spod recv                      # watch: claims the queue as things appear (Ctrl-C to stop)
+spod recv once                 # drain and exit          (spod hpc4 recv … for HPC4)
+spod recv status               # queue depth + receiver heartbeat
+spod recv -o 'C:\Users\me\Desktop'
+```
+
+`spush` appends `ts \t subdir \t size \t abspath` to `~/.spod/outbox`; `spod recv`
+claims it and pulls with the *same* fetcher as `spod get` (4 streams, MD5
+snapshot taken before the transfer, resumable), so the reverse direction gets
+the parallel-stream throughput for free instead of a fresh single-flow protocol
+capped at 255 KB/s. Files with a different `-d` land in different batches
+(parallelFetch flattens one batch into one directory).
+
+Things that are load-bearing here:
+
+- **The queue is claimed by rename, not truncate.** `ssh()` retries a reset
+  connection; a truncate that succeeded remotely but whose output never came
+  back would silently drop every queued path. `claim.<pid>.<ts>` survives that,
+  and leftovers are picked up by the next claim.
+- **A claim file that is not deleted becomes an infinite re-download.** It was,
+  once: the delete used `shellQuote("$HOME/.spod/"+name)`, and shellQuote
+  single-quotes, so `$HOME` never expanded and `rm -f` removed nothing while
+  exiting 0. `dropClaims` now passes bare names after `cd ~/.spod`, verifies
+  nothing is left, and the watch loop backs off 30 s instead of looping when it
+  cannot clean up.
+- **Queue lines are untrusted input** — the home may be shared with other people
+  on the same account. `sanitizeSub` drops `..`, absolute paths and anything
+  deeper than 8 levels so a queued line cannot steer a write out of the
+  download directory.
+- **`~/.local/bin` is on the login PATH but not the non-interactive one.** Hence
+  both a `spush` symlink (works in tmux sessions opened before the update) and a
+  `spush()` wrapper in the managed bashrc block. `ssh cluster 'spush x'` finds
+  neither — use `bash -lc` or the absolute path.
+- Local claims that have not finished are kept in `/tmp/spod[-hpc4]-recv-inflight`,
+  so Ctrl-C mid-transfer re-tries those files instead of losing them; failures
+  are re-queued on the cluster.
 
 ## Remote Setup (both clusters)
 
