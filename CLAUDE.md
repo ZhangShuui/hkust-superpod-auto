@@ -160,7 +160,8 @@ So a push is a queue, not a connection:
 spush out.mp4                  # queue it
 spush -d run7 results/         # a whole directory, tree preserved under Downloads/run7/
 spush -w ckpt.pt               # block until the local side confirms, prints where it landed
-spush -l                       # what is still queued
+spush -l                       # what is still queued, and how long it has waited
+spush -f -d run7 results/      # -f: re-send even what was already delivered
 
 # locally
 spod recv                      # watch: claims the queue as things appear (Ctrl-C to stop)
@@ -212,6 +213,51 @@ Things that are load-bearing here:
 - Local claims that have not finished are kept in `/tmp/spod[-hpc4]-recv-inflight`,
   so Ctrl-C mid-transfer re-tries those files instead of losing them; failures
   are re-queued on the cluster.
+- **`spush` will not queue what you already have.** Pushing a *directory* is the
+  normal way an agent hands back results, and it re-walks the whole tree every
+  time: add one file to `results/`, re-run `spush -d run7 results/`, and without
+  a check every file already delivered is queued again and pulled again. So the
+  queue grew into a pile of things already sitting in Downloads. `spush` now
+  filters candidates against two facts it already had and never read — the
+  current outbox (same `sub`+path already queued) and `~/.spod/receipts` (an
+  `ok` for that path with the *same size and mtime*) — and reports what it
+  skipped, with where those copies landed. A file whose content changed has a
+  new mtime, so it is still sent. The stamp is `stat -Lc '%s %.Y'`: whole
+  seconds would call a file unchanged when a job rewrote it to the same length
+  within the same second, and the fractional part is real on every filesystem
+  here (ns on `/tmp`, ms on NFS and `/project`). Both sides compare it as
+  *text* — 19 significant digits do not survive a trip through a double.
+  `-f` skips the delivered check but not the already-queued one: the drain
+  fetches whatever the file holds at that point, so a second identical queue
+  line buys nothing but a longer queue.
+- **`spush` must never report success without queueing.** The filter is one awk
+  pass, and gawk dies without running `END` if it cannot write its output (a
+  full `/tmp`), leaving an empty tally that the shell arithmetic reads as
+  "nothing new" — exit 0, nothing queued, caller none the wiser. So every
+  candidate must be accounted for as queued, already-queued, or delivered, and
+  the queue file must have grown by exactly the number claimed; otherwise
+  `spush` dies and leaves the outbox untouched.
+- **The receipts file is a ledger, not just a log.** It is what makes the check
+  above possible, so it carries `ts status path dest size mtime` and is trimmed
+  to 2000 lines, not 200 — a single 168-file drop used to push its own earlier
+  entries out, which would offer every one of them for re-sending. Its
+  timestamp comes from the *cluster's* `date +%s`: both readers (`spush -w`, the
+  skip check) compare it against cluster-side times, so a laptop whose clock
+  drifts must not be the one stamping it.
+- **A duplicate queue line is not a second file.** `spod recv status` and
+  `spush -l` count distinct `(sub, path)` — `dedupePush` collapses them before
+  fetching, so counting raw lines reported a queue deeper than the drain. Both
+  also show how long the oldest entry has waited: nothing expires a queue, and a
+  four-day-old entry otherwise rides along with the next push unnoticed. That
+  age prints through `humanAge`, not `humanDuration` — the latter is a
+  stopwatch that returns `--:--` past 99 hours, which is exactly the range
+  these two readouts live in (a queue nobody drained, a receiver last seen days
+  ago showed up as `已离线 --:--`, indistinguishable from "unknown").
+- **`statQueued` must see its own end marker.** It decides which queued paths
+  still exist, and a reply cut short mid-stream makes everything past the cut
+  look deleted — which the caller acts on by dropping those files with a "fail"
+  receipt. It now prints `STATDONE` last and treats a reply without it as
+  "unknown" rather than trusting a partial listing.
 
 ## Remote Setup (both clusters)
 

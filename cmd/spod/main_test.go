@@ -217,3 +217,77 @@ func TestDisplayPath(t *testing.T) {
 		t.Errorf("non-WSL path should pass through, got %q", got)
 	}
 }
+
+func TestAssignNamesSeparatesCollidingBasenames(t *testing.T) {
+	items := assignNames([]pushItem{
+		{sub: "", path: "/out/decoded_e24b_random/compare.png"},
+		{sub: "", path: "/out/decoded_e24b_fixed/compare.png"},
+		{sub: "", path: "/out/e25_plane.png"},
+		{sub: "run7", path: "/other/compare.png"},
+	})
+	want := map[string]string{
+		"/out/decoded_e24b_random/compare.png": "decoded_e24b_random__compare.png",
+		"/out/decoded_e24b_fixed/compare.png":  "decoded_e24b_fixed__compare.png",
+		"/out/e25_plane.png":                   "e25_plane.png",
+		// A different sub is a different directory, so it keeps the plain name.
+		"/other/compare.png": "compare.png",
+	}
+	for _, it := range items {
+		if it.name != want[it.path] {
+			t.Errorf("%s → %q, want %q", it.path, it.name, want[it.path])
+		}
+	}
+}
+
+func TestAssignNamesIsStableAcrossRuns(t *testing.T) {
+	// A resumed transfer must land on the same sidecar, so the same queue has
+	// to yield the same names every time.
+	in := []pushItem{
+		{sub: "", path: "/a/r1/loss.png"},
+		{sub: "", path: "/a/r2/loss.png"},
+		{sub: "", path: "/a/r3/loss.png"},
+	}
+	first, second := assignNames(in), assignNames(in)
+	for i := range first {
+		if first[i].name != second[i].name {
+			t.Fatalf("run 1 named %s %q, run 2 %q", first[i].path, first[i].name, second[i].name)
+		}
+		if first[i].name == filepath.Base(first[i].path) {
+			t.Errorf("%s kept the colliding basename %q", first[i].path, first[i].name)
+		}
+	}
+}
+
+func TestFreeNameFallsBackToDigest(t *testing.T) {
+	// Every ancestor prefix is spoken for, so it must still produce something
+	// unique — and derived only from the path, so a retry picks the same one.
+	taken := map[string]bool{
+		"x.bin": true, "d__x.bin": true, "c__d__x.bin": true,
+		"b__c__d__x.bin": true, "a__b__c__d__x.bin": true,
+	}
+	got := freeName("/a/b/c/d/x.bin", taken)
+	if taken[got] {
+		t.Fatalf("freeName returned a name already taken: %q", got)
+	}
+	if again := freeName("/a/b/c/d/x.bin", taken); again != got {
+		t.Errorf("not deterministic: %q then %q", got, again)
+	}
+}
+
+func TestHumanAgeSpansDays(t *testing.T) {
+	// humanDuration is a stopwatch and gives up past 99h ("--:--"); a queue
+	// nobody drained for four days has to read as four days.
+	for _, c := range []struct {
+		secs int64
+		want string
+	}{
+		{30, "30 秒"},
+		{90, "1 分钟"},
+		{3600, "1 小时"},
+		{4 * 86400, "4 天"},
+	} {
+		if got := humanAge(c.secs); got != c.want {
+			t.Errorf("humanAge(%d) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}

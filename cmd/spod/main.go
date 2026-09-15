@@ -1945,6 +1945,24 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%d B", b)
 }
 
+// humanAge renders how long something has been sitting — a queued file, a
+// receiver that stopped. humanDuration is a stopwatch and gives up past 99
+// hours ("--:--"), which is precisely the range that matters here: a queue
+// nobody drained for four days rendered as "96:00:02", and a receiver last
+// seen last week as "已离线 --:--", which reads as "unknown".
+func humanAge(secs int64) string {
+	switch {
+	case secs < 60:
+		return fmt.Sprintf("%d 秒", secs)
+	case secs < 3600:
+		return fmt.Sprintf("%d 分钟", secs/60)
+	case secs < 86400:
+		return fmt.Sprintf("%d 小时", secs/3600)
+	default:
+		return fmt.Sprintf("%d 天", secs/86400)
+	}
+}
+
 func humanDuration(d time.Duration) string {
 	if d < 0 || d > 99*time.Hour {
 		return "--:--"
@@ -2342,14 +2360,14 @@ func fetchAndVerify(files []*remoteFile, dest string) (map[*remoteFile]error, er
 	for _, f := range files {
 		shellList = append(shellList, shellQuote(f.path))
 	}
-	want := map[string]string{} // basename → md5
+	want := map[string]string{} // remote path → md5
 	if sums, err := ssh("md5sum " + strings.Join(shellList, " ")); err != nil {
 		warn(fmt.Sprintf("远端 MD5 失败，将跳过校验: %v", err))
 	} else {
 		for _, line := range strings.Split(sums, "\n") {
 			f := strings.Fields(strings.TrimSpace(line))
 			if len(f) >= 2 {
-				want[filepath.Base(strings.Join(f[1:], " "))] = f[0]
+				want[strings.Join(f[1:], " ")] = f[0]
 			}
 		}
 	}
@@ -2382,7 +2400,7 @@ func fetchAndVerify(files []*remoteFile, dest string) (map[*remoteFile]error, er
 			results[f] = errors.New("本地文件缺失")
 			continue
 		}
-		exp, haveSum := want[f.base]
+		exp, haveSum := want[f.path]
 		if !haveSum {
 			warn(fmt.Sprintf("%s (%s) — 无远端 MD5，未校验", f.base, humanBytes(fi.Size())))
 			results[f] = nil
@@ -2560,7 +2578,7 @@ human() {
 
 usage() {
     cat >&2 <<'USAGE_EOF'
-  用法: spush [-d 子目录] [-w [秒]] <文件或目录>...
+  用法: spush [-d 子目录] [-w [秒]] [-f] <文件或目录>...
         spush -l          看队列
         spush -c          清空队列
 
@@ -2570,14 +2588,19 @@ usage() {
 
     -d DIR    放进本地下载目录下的子目录
     -w [秒]   等本地确认收到（默认 600 秒；Ctrl-C 走开也不影响传输）
+    -f        已经送达过的也重新排队（默认跳过，见下）
     -l        列出还没被取走的条目
     -c        清空队列
+
+  内容没变、而且已经送达过的文件会被跳过，所以再推一次整个目录只排新东西，
+  不会把上次已经取走的再拉一遍。确实要重发就加 -f。
 USAGE_EOF
 }
 
 mkdir -p "$SPOD_DIR" 2>/dev/null || die "创建 $SPOD_DIR 失败"
 
-sub=""; wait_secs=0; mode="push"
+now=$(date +%s)
+sub=""; wait_secs=0; mode="push"; force=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -d|--dir)   shift; [ $# -gt 0 ] || die "-d 需要一个子目录名"; sub="$1"; shift ;;
@@ -2587,6 +2610,7 @@ while [ $# -gt 0 ]; do
                         *[!0-9]*)   ;;
                         *) wait_secs="$1"; shift ;;
                     esac ;;
+        -f|--force) force=1; shift ;;
         -l|--list)  mode="list";  shift ;;
         -c|--clear) mode="clear"; shift ;;
         -h|--help)  usage; exit 0 ;;
@@ -2598,9 +2622,19 @@ done
 
 if [ "$mode" = "list" ]; then
     [ -s "$OUTBOX" ] || { say "队列是空的"; exit 0; }
-    awk -F'\t' -v g="$c_gry" -v o="$c_off" '
-        {n++; t+=$3; d=($2=="-" ? "" : "  ->  " $2 "/"); printf "    %s%s%s%s\n", g, $4, d, o}
-        END{printf "  %d 个文件在队列里\n", n}' "$OUTBOX" >&2
+    awk -F'\t' -v g="$c_gry" -v o="$c_off" -v now="$now" '
+        function age(s) { if (s < 0) s = 0
+                          if (s < 3600)  return sprintf("%dm", s / 60)
+                          if (s < 86400) return sprintf("%dh", s / 3600)
+                          return sprintf("%dd", s / 86400) }
+        function hs(b) { split("B KB MB GB TB", u, " "); i = 1
+                         while (b >= 1024 && i < 5) { b /= 1024; i++ }
+                         return (i == 1) ? sprintf("%d %s", b, u[i]) : sprintf("%.1f %s", b, u[i]) }
+        !seen[$2 SUBSEP $4]++ {
+            n++; t += $3; d = ($2 == "-" ? "" : "  ->  " $2 "/")
+            printf "    %s%s%s  (%s)%s\n", g, $4, d, age(now - $1), o
+        }
+        END{printf "  %d 个文件在队列里（%s）\n", n, hs(t)}' "$OUTBOX" >&2
     exit 0
 fi
 
@@ -2613,11 +2647,12 @@ fi
 
 [ $# -gt 0 ] || { usage; exit 1; }
 
-now=$(date +%s)
+TMPC=$(mktemp "${TMPDIR:-/tmp}/spod-push.XXXXXX") || die "mktemp 失败"
 TMPQ=$(mktemp "${TMPDIR:-/tmp}/spod-push.XXXXXX") || die "mktemp 失败"
-trap 'rm -f "$TMPQ"' EXIT
-n=0; total=0
+trap 'rm -f "$TMPC" "$TMPQ"' EXIT
 
+# Candidates first, queue lines later: whether a file is worth queueing depends
+# on the outbox and the receipts, and those are read once for the whole batch.
 add_file() {  # $1 绝对路径, $2 目标子目录（可空）
     f="$1"; s="${2:-}"
     case "$f$s" in
@@ -2625,9 +2660,8 @@ add_file() {  # $1 绝对路径, $2 目标子目录（可空）
     esac
     [ -f "$f" ] || { oops "跳过（不是普通文件）: $f"; return; }
     [ -r "$f" ] || { oops "跳过（读不了）: $f"; return; }
-    sz=$(stat -Lc %s "$f" 2>/dev/null) || sz=0
-    printf '%s\t%s\t%s\t%s\n' "$now" "${s:--}" "$sz" "$f" >> "$TMPQ"
-    n=$((n + 1)); total=$((total + sz))
+    st=$(stat -Lc '%s %.Y' "$f" 2>/dev/null) || st="0 0"
+    printf '%s\t%s\t%s\t%s\n' "${s:--}" "${st%% *}" "${st#* }" "$f" >> "$TMPC"
 }
 
 add_path() {
@@ -2653,9 +2687,77 @@ add_path() {
 }
 
 for p in "$@"; do add_path "$p"; done
-[ "$n" -gt 0 ] || die "没有可排队的文件"
+[ -s "$TMPC" ] || die "没有可排队的文件"
 
-( flock -w 10 9 2>/dev/null; cat "$TMPQ" >> "$OUTBOX" ) 9>>"$LOCK"
+# Two things must not be queued again: a path already sitting in the outbox, and
+# a path the receipts say already arrived with this exact size and mtime.
+# Without this, an agent that adds one file to results/ and re-runs
+# "spush -d run7 results/" re-queues the whole directory, and spod recv pulls
+# everything it already delivered — the queue accumulates what you have.
+# Reading and appending happen under the same lock the claim side takes, so a
+# concurrent push cannot slip a duplicate past the check — unless the lock did
+# not come, in which case say so rather than race quietly.
+: >> "$OUTBOX"; : >> "$RECEIPTS"
+exec 9>>"$LOCK"
+flock -w 10 9 2>/dev/null || oops "没拿到队列锁（等了 10s），继续 — 与并发的 spush 可能重复排队" 
+plan=$(awk -F'\t' -v now="$now" -v force="$force" -v ob="$OUTBOX" -v rc="$RECEIPTS" -v tq="$TMPQ" '
+    function base(p,   k, a) { k = split(p, a, "/"); return a[k] }
+    FILENAME == ob { queued[$2 SUBSEP $4] = 1; next }
+    FILENAME == rc {
+        # Last word wins: a later failure retires an earlier delivery.
+        if ($2 == "ok") { dsz[$3] = $5; dmt[$3] = $6; ddst[$3] = $4 }
+        else            { delete dsz[$3]; delete dmt[$3]; delete ddst[$3] }
+        next
+    }
+    {
+        s = $1; sz = $2; mt = $3; path = $4
+        # Queued is queued, even under -f: the drain fetches whatever the file
+        # holds then, so a second identical line buys nothing but a longer queue.
+        if ((s SUBSEP path) in queued) { nq++; next }
+        # Concatenating "" forces a string compare. As numbers these go through
+        # a double and a sub-microsecond mtime difference would vanish.
+        if (!force && path in dsz && (dsz[path] "") == (sz "") && (dmt[path] "") == (mt "")) {
+            nd++
+            if (nd <= 5) dl[nd] = base(path) "  ->  " ddst[path]
+            next
+        }
+        queued[s SUBSEP path] = 1
+        printf("%s\t%s\t%s\t%s\n", now, s, sz, path) >> tq
+        n++; t += sz
+    }
+    END {
+        close(tq)
+        printf "TALLY\t%d\t%d\t%d\t%d\n", n + 0, t + 0, nq + 0, nd + 0
+        for (i = 1; i <= nd && i <= 5; i++) printf "DLIST\t%s\n", dl[i]
+    }
+' "$OUTBOX" "$RECEIPTS" "$TMPC")
+
+set -- $(printf '%s\n' "$plan" | awk -F'\t' '$1 == "TALLY" { print $2, $3, $4, $5 }')
+n=${1:-0}; total=${2:-0}; nq=${3:-0}; nd=${4:-0}
+
+# Every candidate must come out somewhere. Without this an awk that died — bad
+# receipts, a full /tmp — leaves an empty tally, and the arithmetic below reads
+# it as "nothing new to queue" and exits 0: the push silently never happened.
+ncand=$(wc -l < "$TMPC")
+if [ "$((n + nq + nd))" -ne "$ncand" ] || [ "$(wc -l < "$TMPQ")" -ne "$n" ]; then
+    die "排队失败（队列未改动）: $ncand 个候选只落实了 $((n + nq + nd)) 个"
+fi
+
+if [ "$nd" -gt 0 ]; then
+    say "跳过 $nd 个已经送达过、内容也没变的（要重发: spush -f）"
+    printf '%s\n' "$plan" | awk -F'\t' -v g="$c_gry" -v o="$c_off" \
+        '$1 == "DLIST" { printf "    %s%s%s\n", g, $2, o }' >&2
+    [ "$nd" -gt 5 ] && say "  ...还有 $((nd - 5)) 个"
+fi
+[ "$nq" -gt 0 ] && say "跳过 $nq 个已经在队列里的"
+
+if [ "$n" -eq 0 ]; then
+    yay "没有新东西要排队"
+    exit 0
+fi
+
+cat "$TMPQ" >> "$OUTBOX"
+flock -u 9 2>/dev/null
 yay "已排队 $n 个文件（$(human $total)）"
 
 alive=""
@@ -2700,11 +2802,13 @@ exit $rc
 
 // pushItem is one queued file as the cluster recorded it.
 type pushItem struct {
-	ts   int64  // queued at (cluster clock)
-	sub  string // sanitized destination subdirectory under dest, "" for none
-	size int64  // size at queue time — informational; the fetcher re-stats
-	path string // absolute path on the cluster
-	raw  string // the queue line verbatim, so a failure can be re-queued as-is
+	ts    int64  // queued at (cluster clock)
+	sub   string // sanitized destination subdirectory under dest, "" for none
+	size  int64  // size at queue time — informational; the fetcher re-stats
+	mtime string // source mtime as of the pre-fetch stat; goes into the receipt
+	path  string // absolute path on the cluster
+	raw   string // the queue line verbatim, so a failure can be re-queued as-is
+	name  string // local filename under dest/sub — set by assignNames, not parsed
 }
 
 // parsePushLine decodes one outbox line: ts \t sub \t size \t abspath.
@@ -2805,10 +2909,12 @@ the spod push helper instead — their local ` + "`spod recv`" + ` pulls it:
                                           # function exists only in login shells
     ~/.local/bin/spush -d run7 results/   # a directory keeps its tree
     ~/.local/bin/spush -w 300 out.mp4     # wait up to 300s; exits 1 if it did not arrive
-    ~/.local/bin/spush -l                 # what is still queued
+    ~/.local/bin/spush -l                 # what is still queued, and how long it has waited
 
-Files land in the user's Windows Downloads folder (or wherever their ` + "`spod recv`" + `
-points). If nothing is receiving, spush says so and the entry stays queued — tell
+A file the user already received, unchanged, is skipped rather than queued
+again, so re-pushing a whole results/ directory sends only what is new; add -f
+to send it anyway. Files land in the user's Windows Downloads folder (or
+wherever their ` + "`spod recv`" + ` points). If nothing is receiving, spush says so and the entry stays queued — tell
 the user to run ` + "`spod recv`" + ` locally rather than retrying. Queue a path that will
 still exist later: the pull happens afterwards and fails if the job removed the
 file. Throughput is ~1 MB/s, so tar or subset large results before queueing.
@@ -2931,21 +3037,36 @@ type receipt struct {
 	status string // "ok" | "fail"
 	path   string // the cluster-side path, as queued
 	dest   string // where it landed locally, in Windows form when applicable
+	// The delivered file's size and mtime. `spush` skips re-queueing a path
+	// whose receipt says it already arrived with exactly this stamp, which is
+	// what stops a re-pushed directory from dragging its whole history along.
+	size  int64
+	mtime string
 }
 
-// writeReceipts reports back what arrived, so `spush -w` can say "delivered"
-// and print the local path. Receipts are trimmed to the last 200 lines.
+// writeReceipts reports back what arrived. It is two things at once: the log
+// `spush -w` polls to say "delivered", and the ledger `spush` consults to avoid
+// re-queueing a file that is already here unchanged.
+//
+// The timestamp comes from the *cluster's* clock, not this machine's: both
+// readers compare it against cluster-side times (`spush -w` against its own
+// `date +%s`), so a laptop drifting from the cluster must not be the one
+// stamping it.
 func writeReceipts(rs []receipt) {
 	if len(rs) == 0 {
 		return
 	}
 	var b strings.Builder
-	b.WriteString("mkdir -p ~/.spod\ncat >> ~/.spod/receipts << 'SPOD_RCPT_EOF'\n")
-	now := time.Now().Unix()
+	b.WriteString("mkdir -p ~/.spod\nnow=$(date +%s)\n")
+	b.WriteString("awk -v t=\"$now\" 'BEGIN{OFS=\"\\t\"} {print t, $0}' >> ~/.spod/receipts << 'SPOD_RCPT_EOF'\n")
 	for _, r := range rs {
-		fmt.Fprintf(&b, "%d\t%s\t%s\t%s\n", now, r.status, r.path, r.dest)
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%d\t%s\n", r.status, r.path, r.dest, r.size, r.mtime)
 	}
-	b.WriteString("SPOD_RCPT_EOF\ntail -n 200 ~/.spod/receipts > ~/.spod/receipts.tmp && mv -f ~/.spod/receipts.tmp ~/.spod/receipts\n")
+	b.WriteString("SPOD_RCPT_EOF\n")
+	// The ledger has to outlive one big drop: at 200 lines a 168-file batch
+	// would push its own earlier entries out, and `spush` would offer to send
+	// them all again.
+	b.WriteString("tail -n 2000 ~/.spod/receipts > ~/.spod/receipts.tmp && mv -f ~/.spod/receipts.tmp ~/.spod/receipts\n")
 	if _, err := ssh(b.String()); err != nil {
 		warn(fmt.Sprintf("回执写入失败: %v", err))
 	}
@@ -2998,8 +3119,70 @@ func dedupePush(items []pushItem) []pushItem {
 	return out
 }
 
+// assignNames picks the local filename for every queued file. Usually that is
+// its basename, but a batch is flattened into one directory and nothing stops
+// two queued paths from sharing a basename — decoded_e24c_anchor/compare.png
+// and decoded_e25_fanchor/compare.png are one plot from two runs. Left alone
+// they are fetched one after another into the same local path, the last one
+// replaces the others, and all of them get an "ok" receipt, so the loss is
+// silent. `spod get` refuses such a command and tells the user to split it; a
+// drain has nobody to ask and must not drop what it has already claimed, so it
+// prefixes the directory the file came from instead.
+func assignNames(items []pushItem) []pushItem {
+	out := append([]pushItem(nil), items...)
+
+	// Only files landing in the same directory can collide.
+	subs := map[string][]int{}
+	for i := range out {
+		out[i].name = filepath.Base(out[i].path)
+		subs[out[i].sub] = append(subs[out[i].sub], i)
+	}
+
+	for _, idxs := range subs {
+		count := map[string]int{}
+		for _, i := range idxs {
+			count[out[i].name]++
+		}
+		taken := map[string]bool{}
+		var contested []int
+		for _, i := range idxs {
+			if count[out[i].name] > 1 {
+				contested = append(contested, i)
+				continue
+			}
+			taken[out[i].name] = true // uncontested names keep the plain basename
+		}
+		// Queue order, so the same queue always yields the same names and a
+		// resumed transfer still finds its sidecar.
+		for _, i := range contested {
+			out[i].name = freeName(out[i].path, taken)
+			taken[out[i].name] = true
+		}
+	}
+	return out
+}
+
+// freeName walks up from the file's own directory, prefixing one more ancestor
+// each round, until the flattened name is not already spoken for. A path deep
+// enough to keep colliding settles for a digest of itself — ugly, but unique
+// and derived only from the remote path, so a retry picks the same name.
+func freeName(path string, taken map[string]bool) string {
+	base := filepath.Base(path)
+	prefix := ""
+	dir := filepath.Dir(path)
+	for depth := 0; depth < 4 && dir != "/" && dir != "." && dir != ""; depth++ {
+		prefix = filepath.Base(dir) + "__" + prefix
+		if n := prefix + base; !taken[n] {
+			return n
+		}
+		dir = filepath.Dir(dir)
+	}
+	sum := sha256.Sum256([]byte(path))
+	return fmt.Sprintf("%x-%s", sum[:4], base)
+}
+
 // pushBatch is one parallelFetch call's worth of queued files: same
-// destination subdirectory, no two files sharing a basename.
+// destination subdirectory, no two files sharing a local name.
 type pushBatch struct {
 	sub   string
 	items []pushItem
@@ -3025,12 +3208,15 @@ func batchBySub(items []pushItem) []pushBatch {
 			var batch, rest []pushItem
 			taken := map[string]bool{}
 			for _, it := range bySub[sub] {
-				base := filepath.Base(it.path)
-				if taken[base] {
+				name := it.name
+				if name == "" {
+					name = filepath.Base(it.path)
+				}
+				if taken[name] {
 					rest = append(rest, it)
 					continue
 				}
-				taken[base] = true
+				taken[name] = true
 				batch = append(batch, it)
 			}
 			out = append(out, pushBatch{sub, batch})
@@ -3048,7 +3234,7 @@ func batchBySub(items []pushItem) []pushBatch {
 // alone such an entry is re-queued after each failure and the watch loop claims
 // it straight back — a poison entry that spins forever. Checking first lets
 // drainOnce drop it with a receipt instead.
-func statQueued(items []pushItem) map[string]int64 {
+func statQueued(items []pushItem) map[string]fileStamp {
 	var quoted []string
 	seen := map[string]bool{}
 	for _, it := range items {
@@ -3058,21 +3244,48 @@ func statQueued(items []pushItem) map[string]int64 {
 		seen[it.path] = true
 		quoted = append(quoted, shellQuote(it.path))
 	}
-	out, err := ssh("for p in " + strings.Join(quoted, " ") + `; do [ -f "$p" ] && [ -r "$p" ] && printf '%s\t%s\n' "$(stat -Lc %s "$p")" "$p"; done`)
-	if err != nil && out == "" {
-		return nil // treat as "unknown" — the fetch will report the real error
+	// `%.Y` is the mtime with fractional seconds. Whole seconds would call a
+	// file unchanged when a job rewrote it to the same length within the same
+	// second — the stamp has to be finer than the thing it is watching.
+	out, err := ssh("for p in " + strings.Join(quoted, " ") + `; do
+    [ -f "$p" ] && [ -r "$p" ] && printf '%s\t%s\n' "$(stat -Lc '%s %.Y' "$p")" "$p"
+done
+echo STATDONE`)
+	// Only a *complete* listing may be trusted, so the marker has to be the last
+	// line, not merely present: a reply cut short mid-stream makes every path
+	// past the cut look deleted, and the caller drops those with a "fail"
+	// receipt — turning a flaky connection into silent data loss.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[len(lines)-1]) != "STATDONE" {
+		if err != nil {
+			warn(fmt.Sprintf("检查队列文件失败: %v", err))
+		}
+		return nil // "unknown" — the fetch will report the real error
 	}
-	sizes := map[string]int64{}
-	for _, line := range strings.Split(out, "\n") {
-		szStr, path, cut := strings.Cut(strings.TrimSpace(line), "\t")
+	stamps := map[string]fileStamp{}
+	for _, line := range lines {
+		nums, path, cut := strings.Cut(strings.TrimSpace(line), "\t")
 		if !cut {
 			continue
 		}
-		if sz, convErr := strconv.ParseInt(szStr, 10, 64); convErr == nil {
-			sizes[path] = sz
+		szStr, mtStr, split := strings.Cut(nums, " ")
+		if !split {
+			continue
+		}
+		// mtime stays a string: it is only ever compared for equality, and
+		// 19 significant digits do not survive a round trip through a float.
+		if sz, szErr := strconv.ParseInt(szStr, 10, 64); szErr == nil && mtStr != "" {
+			stamps[path] = fileStamp{size: sz, mtime: mtStr}
 		}
 	}
-	return sizes
+	return stamps
+}
+
+// fileStamp identifies one version of a file: re-stat it later and a different
+// size or mtime means the content may have changed.
+type fileStamp struct {
+	size  int64
+	mtime string
 }
 
 // drainOnce claims the cluster's queue and pulls everything in it. It returns
@@ -3097,17 +3310,17 @@ func drainOnce(dest string) (int, bool) {
 
 	// Drop entries whose source no longer exists, with a receipt, rather than
 	// re-queueing them forever.
-	if sizes := statQueued(items); sizes != nil {
+	if stamps := statQueued(items); stamps != nil {
 		var live []pushItem
 		var gone []receipt
 		for _, it := range items {
-			sz, exists := sizes[it.path]
+			st, exists := stamps[it.path]
 			if !exists {
 				warn(fmt.Sprintf("源文件已不在集群上，丢弃: %s", it.path))
-				gone = append(gone, receipt{"fail", it.path, ""})
+				gone = append(gone, receipt{status: "fail", path: it.path})
 				continue
 			}
-			it.size = sz
+			it.size, it.mtime = st.size, st.mtime
 			live = append(live, it)
 		}
 		writeReceipts(gone)
@@ -3118,9 +3331,13 @@ func drainOnce(dest string) (int, bool) {
 		}
 	}
 
+	items = assignNames(items)
 	var totalBytes int64
 	for _, it := range items {
 		totalBytes += it.size
+		if b := filepath.Base(it.path); it.name != b {
+			info(fmt.Sprintf("同名文件，改名保存: %s → %s", b, it.name))
+		}
 	}
 	info(fmt.Sprintf("收到 %d 个文件（%s）", len(items), humanBytes(totalBytes)))
 
@@ -3138,7 +3355,7 @@ func drainOnce(dest string) (int, bool) {
 		files := make([]*remoteFile, 0, len(batch.items))
 		owner := map[*remoteFile]pushItem{}
 		for _, it := range batch.items {
-			rf := &remoteFile{path: it.path, base: filepath.Base(it.path), size: it.size}
+			rf := &remoteFile{path: it.path, base: it.name, size: it.size}
 			files = append(files, rf)
 			owner[rf] = it
 		}
@@ -3147,16 +3364,21 @@ func drainOnce(dest string) (int, bool) {
 			it := owner[rf]
 			if batchErr != nil {
 				failed = append(failed, it)
-				receipts = append(receipts, receipt{"fail", it.path, ""})
+				receipts = append(receipts, receipt{status: "fail", path: it.path})
 				continue
 			}
 			if results[rf] != nil {
 				failed = append(failed, it)
-				receipts = append(receipts, receipt{"fail", it.path, displayPath(filepath.Join(outDir, rf.base))})
+				receipts = append(receipts, receipt{status: "fail", path: it.path, dest: displayPath(filepath.Join(outDir, rf.base))})
 				continue
 			}
 			done++
-			receipts = append(receipts, receipt{"ok", it.path, displayPath(filepath.Join(outDir, rf.base))})
+			receipts = append(receipts, receipt{
+				status: "ok", path: it.path,
+				dest:  displayPath(filepath.Join(outDir, rf.base)),
+				size:  it.size,
+				mtime: it.mtime,
+			})
 		}
 		if batchErr != nil {
 			fail(fmt.Sprintf("拉取失败: %v", batchErr))
@@ -3213,12 +3435,13 @@ func heartbeat(stop <-chan struct{}) {
 
 func cmdRecvStatus() {
 	out, err := ssh(`mkdir -p ~/.spod
-n=0; total=0
+q="0 0 0"
 if [ -s ~/.spod/outbox ]; then
-    n=$(wc -l < ~/.spod/outbox)
-    total=$(awk -F'\t' '{s+=$3} END{print s+0}' ~/.spod/outbox)
+    q=$(awk -F'\t' -v now="$(date +%s)" '
+        !seen[$2 SUBSEP $4]++ { n++; t += $3; if (m == "" || $1 + 0 < m) m = $1 + 0 }
+        END { printf "%d %d %d", n + 0, t + 0, (m == "" ? 0 : now - m) }' ~/.spod/outbox) || q="0 0 0"
 fi
-echo "QUEUE $n $total"
+echo "QUEUE $q"
 if [ -f ~/.spod/recv-alive ]; then
     echo "ALIVE $(( $(date +%s) - $(stat -c %Y ~/.spod/recv-alive) ))"
 else
@@ -3236,11 +3459,17 @@ tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 		switch {
 		case strings.HasPrefix(line, "QUEUE "):
 			var n int
-			var total int64
-			fmt.Sscanf(line, "QUEUE %d %d", &n, &total)
-			if n == 0 {
+			var total, age int64
+			fmt.Sscanf(line, "QUEUE %d %d %d", &n, &total, &age)
+			switch {
+			case n == 0:
 				info("队列: 空")
-			} else {
+			case age >= 3600:
+				// A queue nobody drains just grows; say so rather than let a
+				// four-day-old entry ride along with the next push unnoticed.
+				ok(fmt.Sprintf("队列: %d 个文件待取（%s，最早的已等 %s）",
+					n, humanBytes(total), humanAge(age)))
+			default:
 				ok(fmt.Sprintf("队列: %d 个文件待取（%s）", n, humanBytes(total)))
 			}
 		case strings.HasPrefix(line, "ALIVE "):
@@ -3252,7 +3481,7 @@ tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 			case age < 180:
 				ok(fmt.Sprintf("接收端: 在线（%d 秒前）", age))
 			default:
-				warn(fmt.Sprintf("接收端: 已离线 %s", humanDuration(time.Duration(age)*time.Second)))
+				warn(fmt.Sprintf("接收端: 已离线 %s", humanAge(age)))
 			}
 		case line == "RECENT":
 			inRecent = true
@@ -3264,7 +3493,7 @@ tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 		info("最近送达:")
 		for _, r := range recent {
 			f := strings.Split(r, "\t")
-			if len(f) != 4 {
+			if len(f) < 4 {
 				continue
 			}
 			mark := "✓"
