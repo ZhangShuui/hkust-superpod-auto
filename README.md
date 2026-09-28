@@ -26,6 +26,7 @@ spod get <路径>...    # 拉文件到本地（默认 Windows Downloads，MD5 �
 spod recv             # 接收集群上 spush 推来的文件（守着队列）
 spod recv once        # 取一次队列就退出
 spod recv status      # 看队列 / 接收端是否在线
+spod recv --unpacked  # 不建批次文件夹，文件直接落在目标目录
 spod sync <r> <l>     # 从 SuperPod 并行 rsync 到本地
 spod sync stop        # 停止所有 rsync
 spod speed [秒]       # VPN 隧道测速（默认 60s）
@@ -53,14 +54,19 @@ systemd 守着、给 claude/codex 用的反向隧道，拿它传大文件会把 
 `spod recv` 认领后用 `spod get` 那条并行通道拉下来（4 路并发、MD5 校验、
 断点续传），默认落到 Windows 的 Downloads。
 
+**每收一批单独建一个文件夹**：`Downloads\spod-20260922-1203\`，`spush -d` 的
+子目录再嵌在里面。一次推二十张图不会把 Downloads 埋掉，一批就是一个可以整个
+拖走的文件夹。想要老的平铺行为就加 `--unpacked`。
+
 ```bash
 # 本地：守着（Ctrl-C 退出）
 spod recv                         # 或 spod recv -o 'C:\Users\me\Desktop'
-spod hpc4 recv                    # HPC4 的队列，互不干扰
+spod recv --unpacked              # 不要批次文件夹，直接落在目标目录
+spod hpc4 recv                    # HPC4 的队列，互不干扰（文件夹叫 spod-hpc4-<时间>）
 
 # 集群上（tmux 会话里直接用）
 spush out.mp4                     # 排进队列，本地在跑就立刻被取走
-spush -d run7 results/            # 目录整个推，保留层级到 Downloads/run7/results/
+spush -d run7 results/            # 目录整个推，层级保留到 <批次文件夹>/run7/results/
 spush -w ckpt.pt                  # 等本地回执，收到后打印落地路径
 spush -l                          # 看还有什么没被取走
 ```

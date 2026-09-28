@@ -291,3 +291,114 @@ func TestHumanAgeSpansDays(t *testing.T) {
 		}
 	}
 }
+
+// One drain, one folder — and the name has to be free. Merging into a folder
+// that is already there lets an unrelated batch's same-named file be treated
+// as a partial download to resume.
+func TestNewBatchDirStepsPastExistingFolders(t *testing.T) {
+	dest := t.TempDir()
+	now := time.Date(2026, 9, 22, 15, 30, 0, 0, time.Local)
+
+	first := newBatchDir(dest, "spod", now)
+	if want := filepath.Join(dest, "spod-20260922-1530"); first != want {
+		t.Fatalf("want %s, got %s", want, first)
+	}
+	if err := os.MkdirAll(first, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := newBatchDir(dest, "spod", now), first+"-2"; got != want {
+		t.Fatalf("second drain in the same minute: want %s, got %s", want, got)
+	}
+	// The two clusters drain into the same Downloads folder.
+	if got, want := newBatchDir(dest, "spod-hpc4", now), filepath.Join(dest, "spod-hpc4-20260922-1530"); got != want {
+		t.Fatalf("want %s, got %s", want, got)
+	}
+}
+
+// A retry must land in the folder it started in (the .spodget sidecar is
+// there), but only while that is still a sane place to write.
+func TestResumeBatchDirOnlyWhenUsable(t *testing.T) {
+	tgt = targets["superpod"]
+	t.Setenv("TMPDIR", t.TempDir())
+	dest := t.TempDir()
+	dir := filepath.Join(dest, "spod-20260922-1530")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	saveBatchDir(dir)
+	if got := resumeBatchDir(dest); got != dir {
+		t.Fatalf("interrupted drain should resume into %s, got %q", dir, got)
+	}
+	if got := resumeBatchDir(t.TempDir()); got != "" {
+		t.Errorf("-o moved elsewhere: no partials there, got %q", got)
+	}
+
+	// Stale: nobody came back for a day, so a later push gets its own folder
+	// instead of being filed under an old date.
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(batchStatePath(), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if got := resumeBatchDir(dest); got != "" {
+		t.Errorf("day-old claim should be forgotten, got %q", got)
+	}
+
+	// Folder deleted by hand — nothing left to resume into.
+	saveBatchDir(dir)
+	os.RemoveAll(dir)
+	if got := resumeBatchDir(dest); got != "" {
+		t.Errorf("missing folder, got %q", got)
+	}
+
+	// A settled drain forgets the folder, so the next push opens a new one.
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	saveBatchDir(dir)
+	saveBatchDir("")
+	if got := resumeBatchDir(dest); got != "" {
+		t.Errorf("settled drain should forget the folder, got %q", got)
+	}
+}
+
+// Everything spod installs ON a cluster has to name the command that drains
+// THAT cluster's queue. A helper on HPC4 telling the user to run "spod recv"
+// points them at SuperPod's queue, which drains fine and reports success while
+// the HPC4 files it was about sit there untouched.
+func TestClusterSideTextNamesItsOwnRecvCommand(t *testing.T) {
+	defer func(prev *target) { tgt = prev }(tgt)
+
+	tgt = targets["superpod"]
+	spScript, spNote, spVer := pushHelperScript(), agentNote(), pushHelperVersion()
+	tgt = targets["hpc4"]
+	hpcScript, hpcNote, hpcVer := pushHelperScript(), agentNote(), pushHelperVersion()
+
+	for name, text := range map[string]string{
+		"superpod helper": spScript, "superpod note": spNote,
+		"hpc4 helper": hpcScript, "hpc4 note": hpcNote,
+	} {
+		if strings.Contains(text, "__SPOD_RECV__") {
+			t.Errorf("%s still has an unrendered placeholder", name)
+		}
+	}
+	for name, text := range map[string]string{"helper": spScript, "note": spNote} {
+		if !strings.Contains(text, "spod recv") {
+			t.Errorf("superpod %s never names spod recv", name)
+		}
+	}
+	// "spod hpc4 recv" does not contain "spod recv", so any hit is a leftover.
+	for name, text := range map[string]string{"helper": hpcScript, "note": hpcNote} {
+		if strings.Contains(text, "spod recv") {
+			t.Errorf("hpc4 %s points at SuperPod's queue", name)
+		}
+		if !strings.Contains(text, "spod hpc4 recv") {
+			t.Errorf("hpc4 %s never names spod hpc4 recv", name)
+		}
+	}
+	// The marker gates re-deployment: same marker on both clusters would leave
+	// whichever was installed first in place on the other one.
+	if spVer == hpcVer {
+		t.Errorf("both clusters share helper version %s", spVer)
+	}
+}

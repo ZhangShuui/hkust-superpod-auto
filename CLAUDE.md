@@ -79,6 +79,7 @@ spod get <path>...  # Pull files to Windows Downloads (glob OK, MD5-verified, re
 spod recv           # Receive files pushed from the cluster with `spush` (watch queue)
 spod recv once      # Drain the queue once and exit
 spod recv status    # Queue depth + whether a receiver is online
+spod recv --unpacked  # Skip the per-drain folder; drop the files in the dest itself
 
 spod hpc4           # Same commands against HPC4 — see below
 ```
@@ -168,6 +169,7 @@ spod recv                      # watch: claims the queue as things appear (Ctrl-
 spod recv once                 # drain and exit          (spod hpc4 recv … for HPC4)
 spod recv status               # queue depth + receiver heartbeat
 spod recv -o 'C:\Users\me\Desktop'
+spod recv --unpacked           # old behaviour: straight into Downloads, no folder
 ```
 
 `spush` appends `ts \t subdir \t size \t abspath` to `~/.spod/outbox`; `spod recv`
@@ -176,6 +178,19 @@ snapshot taken before the transfer, resumable), so the reverse direction gets
 the parallel-stream throughput for free instead of a fresh single-flow protocol
 capped at 255 KB/s. Files with a different `-d` land in different batches
 (parallelFetch flattens one batch into one directory).
+
+Each drain lands in **its own dated folder** — `Downloads/spod-20260922-1203/`
+(`spod-hpc4-…` on the other cluster), with any `spush -d` subdir nested inside
+— because a push of twenty plots into Downloads itself buries everything else
+that is in there. `--unpacked` restores the flat layout. Two things hold that
+together: the name is taken only if free (merging into an existing folder would
+let an unrelated batch's same-named file look like a partial download to resume
+into), and the folder is remembered in `/tmp/spod[-hpc4]-recv-batch` until the
+drain settles, so a Ctrl-C or a re-queued failure retries **into the same
+folder** — the `.spodget` sidecar lives there, and a fresh folder would throw
+away every byte already pulled at 255 KB/s per flow. That memory is ignored
+unless the folder still exists under the current `-o` and is under a day old,
+so an abandoned failure cannot keep swallowing later pushes.
 
 An agent running **on the cluster** hands files back the same way, but must call
 `~/.local/bin/spush` by absolute path: its Bash tool runs a non-login shell whose
@@ -201,6 +216,22 @@ Things that are load-bearing here:
   on the same account. `sanitizeSub` drops `..`, absolute paths and anything
   deeper than 8 levels so a queued line cannot steer a write out of the
   download directory.
+- **"Is anyone receiving?" is two facts, not one.** `~/.spod/recv-alive` is
+  touched only by the watch loop, so a user who drains with `spod recv once`
+  looked exactly like one who had never collected a file: `spush` said "本地接收端
+  没在跑" and `recv status` said "从来没连上过". `claimQueue` now stamps
+  `~/.spod/recv-last` (cluster clock, like the receipts) on every drain, and
+  both readouts distinguish "someone is watching right now" from "someone last
+  came through N minutes ago".
+- **Every cluster-side text names the recv command for *that* cluster.** The
+  queues are per-cluster, and a helper on HPC4 that says "run `spod recv`"
+  sends the user to SuperPod's queue — which drains fine, reports success, and
+  leaves the HPC4 files it was about sitting there with nothing looking broken.
+  That is how a queue there went a week undrained. `spush`'s messages and the
+  agent note are templates with `__SPOD_RECV__` substituted at deploy time
+  (`localRecvCmd()`), and `pushHelperVersion()` hashes the *rendered* script so
+  the two clusters re-deploy independently instead of one marker satisfying
+  both.
 - **`~/.local/bin` is on the login PATH but not the non-interactive one.** Hence
   both a `spush` symlink (works in tmux sessions opened before the update) and a
   `spush()` wrapper in the managed bashrc block. `ssh cluster 'spush x'` finds

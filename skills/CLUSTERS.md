@@ -193,5 +193,10 @@ spod recv       / spod hpc4 recv       # receive files pushed from the cluster w
 spod socks      / spod hpc4 socks      # local :1080 vs :1081
 ```
 
+`spod recv` files each drain into its own folder under Downloads —
+`spod-<date>-<time>/` for SuperPod, `spod-hpc4-<date>-<time>/` for HPC4, so the
+two clusters never mix. `--unpacked` drops them in Downloads itself.
+
+
 Never hardcode the username in a skill — read `SUPERPOD_USER` / `HPC4_USER`
 from `.env`, or just let `$USER` expand on the remote side.

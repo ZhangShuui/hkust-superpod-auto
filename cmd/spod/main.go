@@ -2544,17 +2544,31 @@ func cmdGet(args []string) {
 // work identically, and a push made while this machine is asleep simply waits
 // in the queue until the next `spod recv`.
 
+// localRecvCmd is how the user drains THIS cluster's queue from their own
+// machine. Every cluster-side message that tells them to go run it has to name
+// it exactly: a helper on HPC4 saying "run spod recv" sends them to SuperPod's
+// queue instead, which drains successfully, reports success, and leaves HPC4's
+// files sitting there with nothing looking broken.
+func localRecvCmd() string { return spodCmd() + " recv" }
+
+// pushHelperScript renders the helper for the current cluster.
+func pushHelperScript() string {
+	return strings.ReplaceAll(pushHelperTemplate, "__SPOD_RECV__", localRecvCmd())
+}
+
 // pushHelperVersion identifies the deployed copy of pushHelperScript. It is the
 // script's own content hash rather than a hand-maintained number: the installer
 // only rewrites the file when the marker differs, so a bump that someone forgot
-// leaves a stale helper on the cluster with no sign of it.
+// leaves a stale helper on the cluster with no sign of it. Hashing the
+// *rendered* script also re-deploys the two clusters independently — their
+// copies differ by the recv command they name.
 func pushHelperVersion() string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(pushHelperScript)))[:12]
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(pushHelperScript())))[:12]
 }
 
-const pushHelperScript = `#!/bin/bash
-# spod-push — 把集群上的文件排进队列，等本地的 spod recv 取走。
-# 由 spod 自动部署（cmd/spod/main.go: pushHelperScript），手改会在下次连接时被覆盖。
+const pushHelperTemplate = `#!/bin/bash
+# spod-push — 把集群上的文件排进队列，等本地的 __SPOD_RECV__ 取走。
+# 由 spod 自动部署（cmd/spod/main.go: pushHelperTemplate），手改会在下次连接时被覆盖。
 set -u
 
 SPOD_DIR="$HOME/.spod"
@@ -2562,6 +2576,7 @@ OUTBOX="$SPOD_DIR/outbox"
 LOCK="$SPOD_DIR/outbox.lock"
 RECEIPTS="$SPOD_DIR/receipts"
 ALIVE="$SPOD_DIR/recv-alive"
+LAST="$SPOD_DIR/recv-last"
 TAB=$(printf '\t')
 
 c_red=$(printf '\033[31m'); c_grn=$(printf '\033[32m'); c_blu=$(printf '\033[34m')
@@ -2576,6 +2591,14 @@ human() {
         if(i==1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]}'
 }
 
+hage() {
+    awk -v s="$1" 'BEGIN{ if (s < 0) s = 0
+        if (s < 60) printf "%d 秒", s
+        else if (s < 3600) printf "%d 分钟", s / 60
+        else if (s < 86400) printf "%d 小时", s / 3600
+        else printf "%d 天", s / 86400 }'
+}
+
 usage() {
     cat >&2 <<'USAGE_EOF'
   用法: spush [-d 子目录] [-w [秒]] [-f] <文件或目录>...
@@ -2583,7 +2606,7 @@ usage() {
         spush -c          清空队列
 
   文件不是直接推过去的：集群连不到你的机器，只有本地能主动发起连接。
-  spush 把路径排进 ~/.spod/outbox，本地的 spod recv 认领后并行拉走
+  spush 把路径排进 ~/.spod/outbox，本地的 __SPOD_RECV__ 认领后并行拉走
   （4 路并发 + MD5 校验 + 断点续传），默认落到 Windows 的 Downloads。
 
     -d DIR    放进本地下载目录下的子目录
@@ -2692,7 +2715,7 @@ for p in "$@"; do add_path "$p"; done
 # Two things must not be queued again: a path already sitting in the outbox, and
 # a path the receipts say already arrived with this exact size and mtime.
 # Without this, an agent that adds one file to results/ and re-runs
-# "spush -d run7 results/" re-queues the whole directory, and spod recv pulls
+# "spush -d run7 results/" re-queues the whole directory, and __SPOD_RECV__ pulls
 # everything it already delivered — the queue accumulates what you have.
 # Reading and appending happen under the same lock the claim side takes, so a
 # concurrent push cannot slip a duplicate past the check — unless the lock did
@@ -2768,7 +2791,14 @@ fi
 if [ -n "$alive" ]; then
     say "本地接收端在线，马上就会开始拉"
 else
-    say "本地接收端没在跑 — 在本地执行 spod recv 就会取走（队列一直留着）"
+    last=0
+    [ -f "$LAST" ] && last=$(cat "$LAST" 2>/dev/null || echo 0)
+    case "$last" in ""|*[!0-9]*) last=0 ;; esac
+    if [ "$last" -gt 0 ] && [ "$((now - last))" -ge 0 ]; then
+        say "本地没人守着 — 上次取走是 $(hage $((now - last)))前，下次 __SPOD_RECV__ 会一起取（队列一直留着）"
+    else
+        say "本地接收端没在跑 — 在本地执行 __SPOD_RECV__ 就会取走（队列一直留着）"
+    fi
 fi
 
 [ "$wait_secs" -gt 0 ] || exit 0
@@ -2794,7 +2824,7 @@ while IFS= read -r line; do
     case "$st" in
         ok)   yay "$(basename "$path")  ->  $dst" ;;
         fail) oops "$(basename "$path") 本地拉取失败（已重新排队，会再试）"; rc=1 ;;
-        *)    oops "$(basename "$path") 还没被取走 — 队列保留，本地 spod recv 起来后会继续"; rc=1 ;;
+        *)    oops "$(basename "$path") 还没被取走 — 队列保留，本地 __SPOD_RECV__ 起来后会继续"; rc=1 ;;
     esac
 done < "$TMPQ"
 exit $rc
@@ -2881,7 +2911,7 @@ cat > ~/.local/bin/spod-push.new << 'SPOD_PUSH_EOF'
 # spod-push-version: %s
 SPOD_PUSH_EOF
 chmod 755 ~/.local/bin/spod-push.new && mv -f ~/.local/bin/spod-push.new ~/.local/bin/spod-push && echo INSTALLED`,
-		pushHelperVersion(), pushHelperScript, pushHelperVersion())
+		pushHelperVersion(), pushHelperScript(), pushHelperVersion())
 	out, err := ssh(installer)
 	if err != nil {
 		warn(fmt.Sprintf("spush 助手部署失败: %v", err))
@@ -2900,10 +2930,16 @@ chmod 755 ~/.local/bin/spod-push.new && mv -f ~/.local/bin/spod-push.new ~/.loca
 const agentNoteBegin = "<!-- spod-agent-begin -->"
 const agentNoteEnd = "<!-- spod-agent-end -->"
 
-const agentNoteBody = `## Sending a file back to the user's local machine
+// agentNote renders it for the current cluster — the local command that drains
+// THIS queue is the one fact the agent cannot guess.
+func agentNote() string {
+	return strings.ReplaceAll(agentNoteTemplate, "__SPOD_RECV__", localRecvCmd())
+}
+
+const agentNoteTemplate = `## Sending a file back to the user's local machine
 
 This cluster cannot open a connection to the user's machine. Queue the file with
-the spod push helper instead — their local ` + "`spod recv`" + ` pulls it:
+the spod push helper instead — their local ` + "`__SPOD_RECV__`" + ` pulls it:
 
     ~/.local/bin/spush <file>...          # use the absolute path: the spush shell
                                           # function exists only in login shells
@@ -2914,8 +2950,9 @@ the spod push helper instead — their local ` + "`spod recv`" + ` pulls it:
 A file the user already received, unchanged, is skipped rather than queued
 again, so re-pushing a whole results/ directory sends only what is new; add -f
 to send it anyway. Files land in the user's Windows Downloads folder (or
-wherever their ` + "`spod recv`" + ` points). If nothing is receiving, spush says so and the entry stays queued — tell
-the user to run ` + "`spod recv`" + ` locally rather than retrying. Queue a path that will
+wherever their ` + "`__SPOD_RECV__`" + ` points), each drain in its own dated folder.
+If nothing is receiving, spush says so and the entry stays queued — tell the
+user to run ` + "`__SPOD_RECV__`" + ` locally rather than retrying. Queue a path that will
 still exist later: the pull happens afterwards and fails if the job removed the
 file. Throughput is ~1 MB/s, so tar or subset large results before queueing.
 
@@ -2938,7 +2975,7 @@ cat >> ~/.claude/CLAUDE.md << 'SPOD_NOTE_EOF'
 %s
 %s
 %s
-SPOD_NOTE_EOF`, agentNoteBegin, agentNoteEnd, agentNoteBegin, agentNoteBody, agentNoteEnd)
+SPOD_NOTE_EOF`, agentNoteBegin, agentNoteEnd, agentNoteBegin, agentNote(), agentNoteEnd)
 	if _, err := ssh(script); err != nil {
 		warn(fmt.Sprintf("集群侧 agent 说明写入失败: %v", err))
 	}
@@ -2954,6 +2991,11 @@ SPOD_NOTE_EOF`, agentNoteBegin, agentNoteEnd, agentNoteBegin, agentNoteBody, age
 func claimQueue() ([]pushItem, []string, error) {
 	out, err := ssh(`mkdir -p ~/.spod
 cd ~/.spod || exit 1
+# A receiver was here. recv-alive says "someone is watching right now" and only
+# the watch loop touches it, so a user who drains with "recv once" looked, to
+# everything on this side, like a user who had never once collected their
+# files. This is the other half: the last time anyone came at all.
+date +%s > recv-last 2>/dev/null
 : >> outbox
 exec 9>>outbox.lock
 flock -w 10 9 2>/dev/null
@@ -3288,12 +3330,81 @@ type fileStamp struct {
 	mtime string
 }
 
+// ── Where one drain's files land ──
+//
+// By default every drain writes into its own dated folder under the download
+// directory ("spod-20260922-1530/"), so a push arrives as one thing to open
+// instead of sprinkling loose files through Downloads next to everything else
+// the browser ever saved. `spod recv --unpacked` keeps the old flat layout.
+// A `spush -d <sub>` subdirectory still nests inside the folder.
+
+// batchStatePath remembers the folder an unfinished drain was writing into.
+func batchStatePath() string { return tgt.tmp("recv-batch") }
+
+// resumeBatchDir returns that folder when it is still the right one to write
+// into, else "".
+//
+// A retry has to land in the folder it started in: parallelFetch resumes from
+// a .<name>.spodget sidecar sitting next to the partial file, so a fresh
+// folder silently throws away every byte already pulled over a link that
+// moves 255 KB/s per flow. Both checks matter — a -o to somewhere else means
+// those partials are not in this tree at all, and a folder that is gone
+// (deleted by hand, or never created because the drain died early) has
+// nothing to resume from.
+func resumeBatchDir(dest string) string {
+	b, err := os.ReadFile(batchStatePath())
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(string(b))
+	if dir == "" || filepath.Dir(dir) != filepath.Clean(dest) {
+		return ""
+	}
+	if fi, statErr := os.Stat(dir); statErr != nil || !fi.IsDir() {
+		return ""
+	}
+	// Unfinished work gets retried in minutes, not next week. Without this, a
+	// folder left behind by a drain nobody came back to would keep swallowing
+	// every later push, under whatever date that failure happened on.
+	if fi, statErr := os.Stat(batchStatePath()); statErr != nil || time.Since(fi.ModTime()) > 24*time.Hour {
+		return ""
+	}
+	return dir
+}
+
+func saveBatchDir(dir string) {
+	if dir == "" {
+		os.Remove(batchStatePath())
+		return
+	}
+	os.WriteFile(batchStatePath(), []byte(dir+"\n"), 0600)
+}
+
+// newBatchDir names this drain's folder. Minute resolution reads well and
+// collides rarely; when it does collide it steps to the next free suffix
+// rather than merging into an existing folder — two unrelated batches can
+// hold the same basename, and the second one would resume into the first
+// one's file instead of replacing it.
+func newBatchDir(dest, prefix string, now time.Time) string {
+	base := filepath.Join(dest, prefix+"-"+now.Format("20060102-1504"))
+	for i := 1; i < 100; i++ {
+		dir := base
+		if i > 1 {
+			dir = fmt.Sprintf("%s-%d", base, i)
+		}
+		if _, err := os.Lstat(dir); os.IsNotExist(err) {
+			return dir
+		}
+	}
+	return fmt.Sprintf("%s-%d", base, now.Unix())
+}
+
 // drainOnce claims the cluster's queue and pulls everything in it. It returns
 // how many files landed and verified, and whether the drain settled — false
 // means work was left on the cluster (an undeleted claim, or files re-queued
 // after a failure) that would be claimed straight back, so the caller must back
 // off instead of looping into it.
-func drainOnce(dest string) (int, bool) {
+func drainOnce(dest string, unpacked bool) (int, bool) {
 	claimed, claims, err := claimQueue()
 	if err != nil {
 		warn(fmt.Sprintf("读取 %s 队列失败: %v", tgt.label, err))
@@ -3327,8 +3438,25 @@ func drainOnce(dest string) (int, bool) {
 		items = live
 		if len(items) == 0 {
 			saveInflight(nil)
+			saveBatchDir("")
 			return 0, clean
 		}
+	}
+
+	// One folder per drain, unless this drain is picking up where an
+	// interrupted one left off — then it must reuse that folder, flag or not,
+	// or the partly-pulled files in it are re-fetched from zero.
+	root := resumeBatchDir(dest)
+	if root == "" {
+		root = dest
+		if !unpacked {
+			root = newBatchDir(dest, "spod"+tgt.tag, time.Now())
+		}
+	}
+	if root == dest {
+		saveBatchDir("")
+	} else {
+		saveBatchDir(root)
 	}
 
 	items = assignNames(items)
@@ -3346,7 +3474,7 @@ func drainOnce(dest string) (int, bool) {
 	done := 0
 
 	for _, batch := range batchBySub(items) {
-		outDir := filepath.Join(dest, batch.sub)
+		outDir := filepath.Join(root, batch.sub)
 		if err := os.MkdirAll(outDir, 0755); err != nil {
 			fail(fmt.Sprintf("创建目录失败: %v", err))
 			failed = append(failed, batch.items...)
@@ -3387,10 +3515,16 @@ func drainOnce(dest string) (int, bool) {
 	}
 
 	saveInflight(nil)
+	if len(failed) == 0 {
+		// Settled: the next push opens a new folder. Anything that failed was
+		// re-queued, so the folder stays remembered for that retry to resume
+		// into.
+		saveBatchDir("")
+	}
 	requeue(failed)
 	writeReceipts(receipts)
 	if done > 0 {
-		ok(fmt.Sprintf("已收下 %d 个文件 → %s", done, displayPath(dest)))
+		ok(fmt.Sprintf("已收下 %d 个文件 → %s", done, displayPath(root)))
 	}
 	return done, clean && len(failed) == 0
 }
@@ -3447,6 +3581,11 @@ if [ -f ~/.spod/recv-alive ]; then
 else
     echo "ALIVE -1"
 fi
+if [ -s ~/.spod/recv-last ]; then
+    echo "LAST $(( $(date +%s) - $(cat ~/.spod/recv-last) ))"
+else
+    echo "LAST -1"
+fi
 echo RECENT
 tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 	if err != nil {
@@ -3455,6 +3594,11 @@ tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 	}
 	inRecent := false
 	var recent []string
+	// Two different facts: recv-alive is a watch loop holding the line right
+	// now, recv-last is the last time ANY drain came through. Reporting only
+	// the first told a user who runs "recv once" that they had never received
+	// anything in their life.
+	aliveAge, lastAge := int64(-1), int64(-1)
 	for _, line := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(line, "QUEUE "):
@@ -3473,21 +3617,22 @@ tail -n 5 ~/.spod/receipts 2>/dev/null || true`)
 				ok(fmt.Sprintf("队列: %d 个文件待取（%s）", n, humanBytes(total)))
 			}
 		case strings.HasPrefix(line, "ALIVE "):
-			var age int64
-			fmt.Sscanf(line, "ALIVE %d", &age)
-			switch {
-			case age < 0:
-				warn("接收端: 从来没连上过（本地跑 " + spodCmd() + " recv）")
-			case age < 180:
-				ok(fmt.Sprintf("接收端: 在线（%d 秒前）", age))
-			default:
-				warn(fmt.Sprintf("接收端: 已离线 %s", humanAge(age)))
-			}
+			fmt.Sscanf(line, "ALIVE %d", &aliveAge)
+		case strings.HasPrefix(line, "LAST "):
+			fmt.Sscanf(line, "LAST %d", &lastAge)
 		case line == "RECENT":
 			inRecent = true
 		case inRecent && strings.TrimSpace(line) != "":
 			recent = append(recent, line)
 		}
+	}
+	switch {
+	case aliveAge >= 0 && aliveAge < 180:
+		ok(fmt.Sprintf("接收端: 守着（%d 秒前）", aliveAge))
+	case lastAge >= 0:
+		warn(fmt.Sprintf("接收端: 没在守着，上次取走 %s前（%s 即可）", humanAge(lastAge), localRecvCmd()))
+	default:
+		warn("接收端: 从来没取过（本地跑 " + localRecvCmd() + "）")
 	}
 	if len(recent) > 0 {
 		info("最近送达:")
@@ -3525,7 +3670,8 @@ echo "$n"`)
 }
 
 func cmdRecv(args []string) {
-	mode, dest := "watch", ""
+	usage := fmt.Sprintf("用法: %s recv [once|status|clear] [-o <本地目录>] [--unpacked]", spodCmd())
+	mode, dest, unpacked := "watch", "", false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-o", "--out":
@@ -3535,6 +3681,8 @@ func cmdRecv(args []string) {
 			}
 			dest = args[i+1]
 			i++
+		case "--unpacked", "-u":
+			unpacked = true
 		case "once", "one":
 			mode = "once"
 		case "status":
@@ -3542,12 +3690,13 @@ func cmdRecv(args []string) {
 		case "clear":
 			mode = "clear"
 		case "-h", "--help":
-			info(fmt.Sprintf("用法: %s recv [once|status|clear] [-o <本地目录>]", spodCmd()))
+			info(usage)
 			info(fmt.Sprintf("在 %s 上用 spush <文件> 推送，这里负责取回", tgt.label))
+			info("默认每收一批单独建一个 spod-<日期>-<时间> 文件夹；--unpacked 直接落在目标目录里")
 			return
 		default:
 			fail(fmt.Sprintf("未知参数: %s", args[i]))
-			info(fmt.Sprintf("用法: %s recv [once|status|clear] [-o <本地目录>]", spodCmd()))
+			info(usage)
 			os.Exit(1)
 		}
 	}
@@ -3574,19 +3723,24 @@ func cmdRecv(args []string) {
 	ensureAgentNote()
 
 	if mode == "once" {
-		if n, _ := drainOnce(dest); n == 0 {
+		if n, _ := drainOnce(dest, unpacked); n == 0 {
 			info("队列是空的")
 		}
 		return
 	}
 
 	ok(fmt.Sprintf("接收中：%s 上 spush 推来的文件 → %s", tgt.label, displayPath(dest)))
+	if unpacked {
+		info("--unpacked：文件直接落在这个目录里")
+	} else {
+		info("每收一批放进单独的 spod-<日期>-<时间> 文件夹（--unpacked 可关掉）")
+	}
 	info(fmt.Sprintf("在 %s 上执行 spush <文件>（-w 可等回执），Ctrl-C 退出", tgt.label))
 	stop := make(chan struct{})
 	defer close(stop)
 	go heartbeat(stop)
 	for {
-		n, clean := drainOnce(dest)
+		n, clean := drainOnce(dest, unpacked)
 		switch {
 		case !clean:
 			// Something is still claimed on the cluster; re-claiming it
@@ -3787,8 +3941,9 @@ _spod_proxy="http://127.0.0.1:%s"
 # a shared .credentials.json breaks because refresh tokens are single-use (first machine to refresh wins)
 claude() { local _tok=0; if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -r "$HOME/.claude/oauth_token" ]; then export CLAUDE_CODE_OAUTH_TOKEN="$(<"$HOME/.claude/oauth_token")"; _tok=1; fi; export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; [ "$_tok" = 1 ] && unset CLAUDE_CODE_OAUTH_TOKEN; return $rc; }
 codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command codex "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
-# spod: push files back to the local machine (queued here, pulled by 'spod recv' there).
-# ~/.local/bin is not on the non-interactive PATH, so call it by absolute path.
+# spod: push files back to the local machine (queued here, pulled by 'spod recv' /
+# 'spod hpc4 recv' there). ~/.local/bin is not on the non-interactive PATH, so
+# call it by absolute path.
 spush() { "$HOME/.local/bin/spod-push" "$@"; }
 %s
 SPOD_EOF`,
@@ -4313,6 +4468,7 @@ func cmdHelp() {
 		{"spod recv", "接收集群上 spush 推来的文件（守着队列，Ctrl-C 退出）"},
 		{"spod recv once", "把队列里的文件取一次就退出"},
 		{"spod recv status", "看队列 / 接收端在线状态"},
+		{"spod recv --unpacked", "不建批次文件夹，文件直接落在目标目录"},
 		{"spod sync <r> <l>", "从 SuperPod 并行 rsync 到本地"},
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
@@ -4332,6 +4488,7 @@ func cmdHelp() {
 		"  本地：spod recv                    守着，推一个取一个",
 		"  集群：spush out.mp4                排进队列",
 		"  集群：spush -d run7 -w ckpt/*.pt   放进子目录，并等回执",
+		"每收一批单独建一个 Downloads\\spod-<日期>-<时间> 文件夹；--unpacked 关掉",
 	} {
 		fmt.Fprintf(os.Stderr, "    %s%s%s\n", cGray, l, reset)
 	}
