@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -64,6 +65,9 @@ type target struct {
 	defSocks  string // fallback SOCKS5 port — must differ per target
 	unit      string // systemd --user unit that may already own the tunnel
 	tag       string // /tmp filename suffix; "" keeps SuperPod's legacy paths
+
+	tunnelsEnv string // .env key: how many parallel tunnels `spod tunnel run` holds
+	defTunnels int    // fallback for tunnelsEnv
 }
 
 var targets = map[string]*target{
@@ -75,6 +79,7 @@ var targets = map[string]*target{
 		tunnelEnv: "TUNNEL_PORT", relayEnv: "SPOD_RELAY_PORT",
 		socksEnv: "SOCKS_PORT", defSocks: "1080",
 		unit: "spod-tunnel.service", tag: "",
+		tunnelsEnv: "SPOD_TUNNELS", defTunnels: 4,
 	},
 	"hpc4": {
 		key: "hpc4", label: "HPC4",
@@ -84,6 +89,7 @@ var targets = map[string]*target{
 		tunnelEnv: "HPC4_TUNNEL_PORT", relayEnv: "HPC4_RELAY_PORT",
 		socksEnv: "HPC4_SOCKS_PORT", defSocks: "1081",
 		unit: "spod-tunnel-hpc4.service", tag: "-hpc4",
+		tunnelsEnv: "HPC4_TUNNELS", defTunnels: 1,
 	},
 }
 
@@ -1086,6 +1092,326 @@ func stopTunnel() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	ok(fmt.Sprintf("隧道已关闭 (pid=%d)", pid))
+}
+
+// ── Reverse tunnels on cluster-allocated ports (`spod tunnel run`) ──
+//
+// `spod tunnel run` is what the systemd unit (tgt.unit) runs. It holds
+// tunnelCount() reverse tunnels to the cluster, each on a port the cluster
+// allocates (-R 0), and every connection registers itself in
+// ~/.spod/tunnels/<owner>-<slot> on the cluster, which is where the relay
+// finds its upstreams.
+//
+// Why not one fixed port: when the VPN drops, the cluster never sees the old
+// connection close, so its sshd keeps holding the -R listener. A fresh
+// connection asking for the same port fails ExitOnForwardFailure — a full
+// login per retry — for as long as the server takes to give up on the old one:
+// 3–5 minutes after every 4-hourly VPN renewal, by the end of which SuperPod
+// refuses new connections from us outright. A port per connection cannot
+// collide with that ghost, and the registration records the connection's sshd
+// (PID and start time), so the next connection for the same slot kills the
+// ghost instead of waiting it out.
+//
+// Why several: one SSH connection is one TCP flow, which tops out at a few
+// hundred KB/s over this VPN, and every request queues behind whatever the
+// busiest session is uploading through it. N connections are N congestion
+// windows — the same reason spod get pulls over four streams.
+
+func tunnelCount() int {
+	n, err := strconv.Atoi(envOr(tgt.tunnelsEnv, ""))
+	if err != nil || n < 1 {
+		return tgt.defTunnels
+	}
+	return min(n, 8)
+}
+
+// tunnelOwner names this machine in the registrations, so a second provider on
+// the same account (with units and slots of its own) never touches ours.
+func tunnelOwner() string {
+	name, _ := os.Hostname()
+	if id, err := os.ReadFile("/etc/machine-id"); err == nil && len(id) >= 8 {
+		name += "-" + string(id[:8])
+	}
+	return regexp.MustCompile(`[^A-Za-z0-9_.-]`).ReplaceAllString(name, "_")
+}
+
+// tunnelRegisterScript runs on the cluster as the tunnel connection's own
+// command. It reads the allocated port from stdin, records
+// "<node> <port> <sshd pid> <sshd start time> <epoch>" for the slot, and then
+// keeps the session open by reading stdin until the connection goes away.
+//
+// $PPID is this connection's sshd, the process holding the listener. Before
+// the record is overwritten, the slot's previous connection is killed if it is
+// still there on this node: same PID, same start time (a recycled PID is left
+// alone), still an sshd. Its client end is gone by construction — a slot only
+// reconnects after its ssh exited here — so on the cluster it can only be a
+// ghost. Slots above n are this owner's leftovers from a larger count.
+func tunnelRegisterScript(owner string, slot, n int) string {
+	return fmt.Sprintf(`read -r port || exit 1
+d=$HOME/.spod/tunnels; f=$d/%[1]s-%[2]d; host=$(hostname -s); me=$PPID
+mkdir -p "$d" || exit 1
+st() { [ -r /proc/$1/stat ] && sed 's/.*) //' /proc/$1/stat | awk '{print $20}'; }
+note=
+if [ -f "$f" ]; then
+	read -r oh op opid ost _ < "$f"
+	if [ "$oh" = "$host" ] && [ -n "$opid" ] && [ "$opid" != "$me" ] && [ -n "$ost" ] && [ "$(st "$opid")" = "$ost" ]; then
+		case "$(cat /proc/$opid/comm 2>/dev/null)" in
+		sshd*) kill "$opid" 2>/dev/null && note=" (killed stale sshd $opid)" ;;
+		esac
+	fi
+fi
+for g in "$d"/%[1]s-*; do
+	s=${g##*-}
+	[ "$s" -gt %[3]d ] 2>/dev/null && rm -f "$g"
+done
+echo "$host $port $me $(st $me) $(date +%%s)" > "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f" || exit 1
+echo "registered $host:$port$note"
+exec cat > /dev/null`, owner, slot, n)
+}
+
+var allocatedPortRE = regexp.MustCompile(`^Allocated port (\d+) for remote forward`)
+
+// parseAllocatedPort picks the port out of ssh's "Allocated port N for remote
+// forward to ..." (LogLevel INFO), the only place a -R 0 port is reported.
+func parseAllocatedPort(line string) (int, bool) {
+	m := allocatedPortRE.FindStringSubmatch(line)
+	if m == nil {
+		return 0, false
+	}
+	p, err := strconv.Atoi(m[1])
+	return p, err == nil && p > 0 && p < 65536
+}
+
+// nextTunnelDelay is how long a slot waits before reconnecting, given its last
+// wait, the last line ssh printed and how long the connection held. An attempt
+// that never reached sshd (VPN down) costs the cluster nothing, and repeating
+// it quickly is what brings the tunnel back seconds after the VPN does. One
+// that got in and still failed backs off, since each of those is a login — and
+// a rejected login waits ten minutes, because enough of them lock the account.
+func nextTunnelDelay(prev time.Duration, lastLine string, held time.Duration) time.Duration {
+	const floor, ceiling = 5 * time.Second, 2 * time.Minute
+	switch {
+	case isFatalSSHErr(lastLine):
+		return 10 * time.Minute
+	case held >= 2*time.Minute, sshNeverConnected(lastLine), prev < floor:
+		return floor
+	default:
+		return min(prev*2, ceiling)
+	}
+}
+
+// sshNeverConnected reports whether ssh failed before any TCP connection to
+// sshd existed. A banner-exchange timeout did connect — that is sshd too busy
+// to answer, not a missing network — so it backs off like any other failure.
+func sshNeverConnected(line string) bool {
+	if strings.Contains(line, "banner exchange") {
+		return false
+	}
+	for _, m := range []string{"Connection timed out", "No route to host", "Network is unreachable", "Could not resolve hostname", "Connection refused"} {
+		if strings.Contains(line, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func tunnelLog(slot int, msg string) { fmt.Fprintf(os.Stderr, "[%d] %s\n", slot, msg) }
+
+// tunnelSlotOnce holds one tunnel connection until it ends. It returns the last
+// line ssh printed and how long the connection stayed registered, which is
+// what nextTunnelDelay needs.
+func tunnelSlotOnce(slot, n int, owner string) (string, time.Duration, error) {
+	cmd := exec.Command("ssh",
+		// Own connection, never the shared mux: joining it would hand the -R to
+		// the master and exit at once (see the ControlPath=none note in ensureTunnel).
+		"-o", "ControlMaster=no", "-o", "ControlPath=none",
+		"-o", "BatchMode=yes", "-o", "LogLevel=INFO", // INFO prints the allocated port
+		"-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+		"-o", "TCPKeepAlive=yes", "-o", "StrictHostKeyChecking=accept-new",
+		"-R", "0:127.0.0.1:"+localPort,
+		host, tunnelRegisterScript(owner, slot, n))
+	// Plain pipes rather than cmd.*Pipe: Wait closes those as soon as ssh
+	// exits, which can swallow the last line it printed — the one saying why.
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return "", 0, err
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		return "", 0, err
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		outR.Close()
+		outW.Close()
+		return "", 0, err
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = inR, outW, errW
+	err = cmd.Start()
+	inR.Close()
+	outW.Close()
+	errW.Close()
+	// The remote side reads stdin until EOF: closing inW ends the session.
+	defer inW.Close()
+	if err != nil {
+		outR.Close()
+		errR.Close()
+		return "", 0, err
+	}
+
+	portc := make(chan int, 1)
+	var mu sync.Mutex
+	last := ""
+	errDone := make(chan struct{})
+	go func() {
+		defer close(errDone)
+		defer errR.Close()
+		sc := bufio.NewScanner(errR)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if p, ok := parseAllocatedPort(line); ok {
+				select {
+				case portc <- p:
+				default:
+				}
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			tunnelLog(slot, "ssh: "+line)
+			mu.Lock()
+			last = line
+			mu.Unlock()
+		}
+	}()
+	registered := make(chan string, 1)
+	go func() {
+		defer outR.Close()
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if strings.HasPrefix(line, "registered ") {
+				select {
+				case registered <- line:
+				default:
+				}
+			} else if line != "" {
+				tunnelLog(slot, "remote: "+line)
+			}
+		}
+	}()
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	lastLine := func() string {
+		<-errDone
+		mu.Lock()
+		defer mu.Unlock()
+		return last
+	}
+	abort := func(why error) (string, time.Duration, error) {
+		cmd.Process.Kill()
+		<-exited
+		return lastLine(), 0, why
+	}
+
+	var port int
+	select {
+	case port = <-portc:
+	case err := <-exited:
+		return lastLine(), 0, fmt.Errorf("ssh exited before a port was allocated (%v)", err)
+	case <-time.After(45 * time.Second):
+		return abort(errors.New("no port allocated within 45s"))
+	}
+	if _, err := fmt.Fprintf(inW, "%d\n", port); err != nil {
+		return abort(err)
+	}
+	select {
+	case line := <-registered:
+		tunnelLog(slot, line)
+	case err := <-exited:
+		return lastLine(), 0, fmt.Errorf("ssh exited during registration (%v)", err)
+	case <-time.After(45 * time.Second):
+		return abort(errors.New("registration did not answer within 45s"))
+	}
+	since := time.Now()
+	err = <-exited
+	return lastLine(), time.Since(since), fmt.Errorf("connection ended after %s (%v)", time.Since(since).Round(time.Second), err)
+}
+
+func runTunnelSlot(slot, n int, owner string) {
+	var delay time.Duration
+	for {
+		last, held, err := tunnelSlotOnce(slot, n, owner)
+		delay = nextTunnelDelay(delay, last, held)
+		tunnelLog(slot, fmt.Sprintf("%v; reconnecting in %s", err, delay))
+		time.Sleep(delay)
+	}
+}
+
+// cmdTunnelRun is the systemd unit's main process. Stopping the unit takes the
+// ssh children with it (KillMode=control-group), so there is nothing to clean up.
+func cmdTunnelRun() {
+	n, owner := tunnelCount(), tunnelOwner()
+	fmt.Fprintf(os.Stderr, "%s: %d tunnel(s) %s → 127.0.0.1:%s, registered as %s-<slot>\n",
+		tgt.label, n, host, localPort, owner)
+	for slot := 1; slot <= n; slot++ {
+		go runTunnelSlot(slot, n, owner)
+		time.Sleep(3 * time.Second) // spread the logins
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	<-sig
+}
+
+// tunnelStatus shows what the relay works from: every registration on the
+// cluster, whether its port still listens on the login node spod lands on, and
+// the relay's latest log lines.
+func tunnelStatus() {
+	if st := tunnelUnitState(); st != "" {
+		info(fmt.Sprintf("%s: %s", tgt.unit, st))
+	}
+	out, err := ssh(`host=$(hostname -s); now=$(date +%s); echo "node $host"
+for f in ~/.spod/tunnels/*; do
+	[ -f "$f" ] || continue
+	case "$f" in *.tmp.*) continue ;; esac
+	read -r h p pid st ts < "$f"
+	l=elsewhere
+	if [ "$h" = "$host" ]; then ss -ltn | grep -q "127.0.0.1:$p " && l=listening || l=gone; fi
+	echo "reg $(basename "$f") $h $p $l $((now - ${ts:-now}))"
+done
+tail -n 6 /tmp/spod-relay-$(id -u).log 2>/dev/null | sed 's/^/log /'`)
+	if err != nil {
+		fail(fmt.Sprintf("读不到 %s 上的隧道登记: %v", tgt.label, err))
+		return
+	}
+	regs := 0
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 2 && f[0] == "node":
+			info(fmt.Sprintf("登录节点: %s", f[1]))
+		case len(f) == 6 && f[0] == "reg":
+			regs++
+			age, _ := strconv.ParseInt(f[5], 10, 64)
+			msg := fmt.Sprintf("%-28s %s:%s  %s，登记于 %s前", f[1], f[2], f[3], f[4], humanAge(age))
+			if f[4] == "listening" {
+				ok(msg)
+			} else {
+				warn(msg)
+			}
+		case len(f) > 0 && f[0] == "log":
+			fmt.Fprintf(os.Stderr, "    %s%s%s\n", cGray, strings.TrimPrefix(line, "log "), reset)
+		}
+	}
+	if regs == 0 {
+		warn(fmt.Sprintf("%s 上没有隧道登记（%s 由 systemd 跑 %s tunnel run 时才会有）", tgt.label, tgt.unit, spodCmd()))
+	}
 }
 
 // ── SOCKS proxy ──
@@ -4051,11 +4377,13 @@ SPOD_EOF`,
 }
 
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
-// It sits between claude/codex and the SSH tunnel, absorbing short outages
+// It sits between claude/codex and the SSH tunnels, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
-// Both this relay and the upstream SSH tunnel bind per-user ports derived
-// from the remote UID (18000+uid%1000 and 17000+uid%1000 respectively) to
-// avoid collisions on shared login nodes.
+// The relay binds a per-user port derived from the remote UID (18000+uid%1000)
+// to avoid collisions on shared login nodes. Its upstreams are the tunnels
+// `spod tunnel run` registers in ~/.spod/tunnels (cluster-allocated ports,
+// see tunnelRegisterScript), plus the legacy fixed 17000+uid%1000 port that an
+// autossh started by ensureTunnel still binds.
 const relayScript = `#!/usr/bin/env python3
 # TCP relay with half-close handling + explicit settimeout(None) after
 # connect. socket.create_connection(timeout=N) leaks N as the socket's
@@ -4067,12 +4395,106 @@ import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
 RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
+TICK=float(os.environ.get("SPOD_RELAY_TICK","10"))
+PROBE_TIMEOUT=float(os.environ.get("SPOD_RELAY_PROBE_TIMEOUT","15"))
+# After one direction closes, how long the other may keep going. HTTPS through
+# CONNECT never half-closes for long; an upstream that never answers (a ghost
+# listener, see below) would otherwise hold its handler, and a slot, forever.
+GRACE=60
+REG=os.path.expanduser("~/.spod/tunnels")
+HOST=socket.gethostname().split(".")[0]
 # Cap concurrent handlers. During a long tunnel outage, every retry from
 # claude/codex would otherwise spawn a fresh handler that sits in the 900s
 # reconnect loop, accumulating threads + sockets without bound. Drop the
 # overflow immediately so the client sees a fast reset and retries later.
 MAX_INFLIGHT=50; SEM=threading.Semaphore(MAX_INFLIGHT)
-def pipe(src,dst):
+LOCK=threading.Lock();SCAN=threading.Lock()
+UP={}    # port -> {"ok": None|True|False, "fails": int, "conns": set of (client, upstream)}
+FILES={} # registration file -> port, as last read (only touched under SCAN)
+def log(m):
+    if LOG:print(time.strftime("%m-%d %H:%M:%S"),"[relay]",m,flush=True)
+def shut(pair):
+    for s in pair:
+        try:s.shutdown(socket.SHUT_RDWR)
+        except:pass
+def rescan():
+    # Registrations on this login node. A file that can't be read right now
+    # (NFS) keeps its last value; only a file that is gone, or now names another
+    # port or node, retires the old port.
+    if not SCAN.acquire(blocking=False):return
+    try:scan()
+    finally:SCAN.release()
+def scan():
+    # No directory yet means no registrations, and the legacy port must still
+    # be offered; any other listing failure keeps what was read last time.
+    try:names=[n for n in os.listdir(REG) if ".tmp." not in n]
+    except FileNotFoundError:names=[]
+    except OSError:names=None
+    if names is not None:
+        for n in list(FILES):
+            if n not in names:del FILES[n]
+        for n in names:
+            try:
+                with open(os.path.join(REG,n)) as f:w=f.read().split()
+                FILES[n]=int(w[1]) if len(w)>=2 and w[0]==HOST else None
+            except (OSError,ValueError,IndexError):pass
+    want={p for p in FILES.values() if p}|{UP_PORT}
+    with LOCK:
+        for p in list(UP):
+            if p not in want:
+                # Its slot re-registered: that connection is gone from the
+                # client's side, so whatever still rides it is dead weight.
+                e=UP.pop(p)
+                for pair in list(e["conns"]):shut(pair)
+                log(f"upstream :{p} retired, closed {len(e['conns'])} connection(s)")
+        for p in want:
+            if p not in UP:
+                UP[p]={"ok":None,"fails":0,"conns":set()}
+                if p!=UP_PORT:log(f"upstream :{p} registered")
+def probe(p):
+    # Clash answers a bare GET with its own 400 and goes nowhere, so a reply
+    # proves relay -> tunnel -> ssh -> local Clash end to end. A ghost listener
+    # (an sshd whose client vanished with the VPN) takes the connect and never
+    # answers. Refused means nothing listens: down at once, no second strike.
+    try:s=socket.create_connection(("127.0.0.1",p),timeout=3)
+    except OSError:return "refused"
+    try:
+        s.settimeout(PROBE_TIMEOUT);s.sendall(b"GET / HTTP/1.0\r\n\r\n");got=b""
+        while len(got)<5:
+            b=s.recv(5-len(got))
+            if not b:break
+            got+=b
+        return "ok" if got==b"HTTP/" else "silent"
+    except OSError:return "silent"
+    finally:s.close()
+def check(p):
+    r=probe(p)
+    with LOCK:
+        e=UP.get(p)
+        if e is None:return
+        was=e["ok"]
+        if r=="ok":e["ok"],e["fails"]=True,0
+        else:
+            e["fails"]+=1
+            if r=="refused" or e["fails"]>=2 or was is None:e["ok"]=False
+    if e["ok"]!=was and (p!=UP_PORT or e["ok"]):
+        log(f"upstream :{p} {'up' if e['ok'] else 'down ('+r+')'}")
+def health():
+    while True:
+        rescan()
+        with LOCK:ports=list(UP)
+        ts=[threading.Thread(target=check,args=(p,),daemon=True) for p in ports]
+        for t in ts:t.start()
+        for t in ts:t.join(PROBE_TIMEOUT+5)
+        time.sleep(TICK)
+def pick(skip):
+    # Fewest live connections wins: every tunnel is its own TCP flow, so the
+    # point is to keep any one of them from carrying the lot.
+    with LOCK:
+        c=[(len(e["conns"]),p) for p,e in UP.items() if e["ok"] is not False and p not in skip]
+        if not c:c=[(len(e["conns"]),p) for p,e in UP.items() if p not in skip]
+    return min(c)[1] if c else None
+def pipe(src,dst,done):
     try:
         while True:
             b=src.recv(65536)
@@ -4084,30 +4506,44 @@ def pipe(src,dst):
     except:
         try:dst.shutdown(socket.SHUT_WR)
         except:pass
+    finally:done.set()
 def handle(c):
     if not SEM.acquire(blocking=False):
-        if LOG:print(f"[relay] backpressure: dropped (>={MAX_INFLIGHT} inflight)",flush=True)
+        log(f"backpressure: dropped (>={MAX_INFLIGHT} inflight)")
         try:c.close()
         except:pass
         return
     try:
         c.settimeout(None)
         c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-        end=time.time()+RETRY_SEC;n=0;delay=3
+        end=time.time()+RETRY_SEC;n=0;delay=3;skip=set();u=None
         while time.time()<end:
-            try:
-                u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3);break
-            except:
-                n+=1;time.sleep(delay);delay=min(delay*2,30)
-        else:
-            if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
+            p=pick(skip)
+            if p is not None:
+                try:u=socket.create_connection(("127.0.0.1",p),timeout=3);break
+                except OSError:
+                    skip.add(p)
+                    with LOCK:
+                        if p in UP:UP[p]["ok"]=False
+                    continue
+            n+=1;skip=set();time.sleep(delay);delay=min(delay*2,30);rescan()
+        if u is None:
+            log(f"tunnel down {RETRY_SEC}s, drop")
             c.close();return
-        if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
+        if n:log(f"recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries) via :{p}")
         u.settimeout(None)  # critical: clear the 3s timeout leaked by create_connection
         u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-        a=threading.Thread(target=pipe,args=(c,u),daemon=True)
-        b=threading.Thread(target=pipe,args=(u,c),daemon=True)
-        a.start();b.start();a.join();b.join()
+        pair=(c,u)
+        with LOCK:
+            if p in UP:UP[p]["conns"].add(pair)
+        done=threading.Event()
+        a=threading.Thread(target=pipe,args=(c,u,done),daemon=True)
+        b=threading.Thread(target=pipe,args=(u,c,done),daemon=True)
+        a.start();b.start();done.wait();a.join(GRACE);b.join(GRACE)
+        if a.is_alive() or b.is_alive():
+            shut(pair);a.join();b.join()
+        with LOCK:
+            if p in UP:UP[p]["conns"].discard(pair)
         try:c.close()
         except:pass
         try:u.close()
@@ -4118,8 +4554,10 @@ signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 srv.bind(("127.0.0.1",LISTEN));srv.listen(64)
-if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT} (uid={os.getuid()})",flush=True)
+log(f"127.0.0.1:{LISTEN} -> tunnels registered in {REG} for {HOST} + legacy :{UP_PORT} (uid={os.getuid()})")
 with open(os.path.expanduser("~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
+rescan()
+threading.Thread(target=health,daemon=True).start()
 while True:
     c,_=srv.accept()
     threading.Thread(target=handle,args=(c,),daemon=True).start()
@@ -4554,7 +4992,9 @@ func cmdHelp() {
 		{"spod vpn restart", "重启 VPN"},
 		{"spod vpn status", "查看 VPN + SuperPod 状态"},
 		{"spod vpn log", "实时查看 VPN 日志"},
-		{"spod tunnel", "启动 / 检查 SSH 隧道"},
+		{"spod tunnel", "启动 / 检查 SSH 隧道和 relay"},
+		{"spod tunnel status", "集群上登记的隧道、端口是否在听、relay 日志"},
+		{"spod tunnel run", "前台维持多条隧道（systemd 单元的主进程）"},
 		{"spod tunnel stop", "关闭隧道"},
 		{"spod socks", "启动 SOCKS5 代理（Windows 可用）"},
 		{"spod socks stop", "关闭 SOCKS5 代理"},
@@ -4646,10 +5086,28 @@ func dispatch(args []string) {
 			cmdVpnStart()
 		}
 	case "tunnel":
-		if len(args) > 1 && args[1] == "stop" {
+		sub := ""
+		if len(args) > 1 {
+			sub = args[1]
+		}
+		switch sub {
+		case "stop":
 			stopTunnel()
-		} else {
+		case "run":
+			cmdTunnelRun()
+		case "status":
+			tunnelStatus()
+		case "":
 			ensureTunnel()
+			// The relay is the tunnels' only consumer and picks up a new
+			// relayScript by restarting — this is the one-shot way to deploy it.
+			ensureRelay()
+		default:
+			// Not a fall-through to the above: that can restart the relay,
+			// and `spod tunnel --help` once did exactly that.
+			fail(fmt.Sprintf("未知子命令: %s tunnel %s", spodCmd(), sub))
+			info(fmt.Sprintf("用法: %s tunnel [status|run|stop]", spodCmd()))
+			os.Exit(1)
 		}
 	case "socks":
 		sub := ""

@@ -1,10 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -129,6 +137,329 @@ func TestRunningTunnelActionOnlyRebuildsOnExplicitFree(t *testing.T) {
 		if got := runningTunnelAction(c.stdout, c.stderr, c.err); got != c.want {
 			t.Errorf("%s: want %d, got %d", c.name, c.want, got)
 		}
+	}
+}
+
+func TestParseAllocatedPort(t *testing.T) {
+	if p, ok := parseAllocatedPort("Allocated port 38499 for remote forward to 127.0.0.1:7890"); !ok || p != 38499 {
+		t.Fatalf("want 38499, got %d %v", p, ok)
+	}
+	for _, line := range []string{
+		"Warning: Permanently added 'hpc4.ust.hk' (ED25519) to the list of known hosts.",
+		"Allocated port 0 for remote forward to 127.0.0.1:7890",
+		"Allocated port 70000 for remote forward to 127.0.0.1:7890",
+	} {
+		if p, ok := parseAllocatedPort(line); ok {
+			t.Errorf("%q: took %d as a port", line, p)
+		}
+	}
+}
+
+// Attempts that never reached sshd repeat quickly — that is what brings the
+// tunnels back seconds after the VPN; anything that logged in backs off.
+func TestNextTunnelDelay(t *testing.T) {
+	down := "ssh: connect to host superpod.ust.hk port 22: Connection timed out"
+	reset := "kex_exchange_identification: read: Connection reset by peer"
+	cases := []struct {
+		name string
+		prev time.Duration
+		line string
+		held time.Duration
+		want time.Duration
+	}{
+		{"first failure", 0, reset, 0, 5 * time.Second},
+		{"reset backs off", 20 * time.Second, reset, 0, 40 * time.Second},
+		{"capped", 2 * time.Minute, reset, 0, 2 * time.Minute},
+		{"vpn down stays quick", 2 * time.Minute, down, 0, 5 * time.Second},
+		{"busy sshd is not a missing network", 20 * time.Second, "Connection timed out during banner exchange", 0, 40 * time.Second},
+		{"a connection that held resets the backoff", 2 * time.Minute, "Timeout, server superpod.ust.hk not responding.", 3 * time.Hour, 5 * time.Second},
+		{"rejected login waits", 5 * time.Second, "<itsc-id>@superpod.ust.hk: Permission denied (publickey).", 0, 10 * time.Minute},
+	}
+	for _, c := range cases {
+		if got := nextTunnelDelay(c.prev, c.line, c.held); got != c.want {
+			t.Errorf("%s: want %s, got %s", c.name, c.want, got)
+		}
+	}
+}
+
+func TestTunnelCount(t *testing.T) {
+	old := tgt
+	defer func() { tgt = old }()
+	tgt = targets["superpod"]
+	for env, want := range map[string]int{"": 4, "2": 2, "0": 4, "junk": 4, "99": 8} {
+		t.Setenv("SPOD_TUNNELS", env)
+		if got := tunnelCount(); got != want {
+			t.Errorf("SPOD_TUNNELS=%q: want %d, got %d", env, want, got)
+		}
+	}
+}
+
+// The owner goes into a remote file name and an unquoted glob.
+func TestTunnelOwnerIsShellSafe(t *testing.T) {
+	if o := tunnelOwner(); o == "" || regexp.MustCompile(`[^A-Za-z0-9_.-]`).MatchString(o) {
+		t.Fatalf("owner %q is not shell-safe", o)
+	}
+}
+
+// procStart reads a process's start time the way the register script does.
+func procStart(t *testing.T, pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	return strings.Fields(s[strings.LastIndex(s, ") ")+2:])[19]
+}
+
+// startFakeSshd runs `sleep` under the name sshd, which is all the register
+// script checks before it kills a slot's previous connection.
+func startFakeSshd(t *testing.T, dir string) *exec.Cmd {
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep binary")
+	}
+	b, err := os.ReadFile(sleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "sshd")
+	if err := os.WriteFile(bin, b, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	return cmd
+}
+
+func TestTunnelRegisterScriptKillsOnlyItsOwnGhost(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("needs /proc")
+	}
+	home := t.TempDir()
+	dir := filepath.Join(home, ".spod", "tunnels")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	hostOut, err := exec.Command("hostname", "-s").Output()
+	if err != nil {
+		t.Skip("no hostname -s")
+	}
+	node := strings.TrimSpace(string(hostOut))
+	ghost := startFakeSshd(t, t.TempDir())
+	recycled := startFakeSshd(t, t.TempDir())
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("me-1", fmt.Sprintf("%s 40001 %d %s 0", node, ghost.Process.Pid, procStart(t, ghost.Process.Pid)))
+	// Same slot name pattern, but the start time says it is another process now.
+	write("me-2", fmt.Sprintf("%s 40002 %d 1 0", node, recycled.Process.Pid))
+	write("me-3", fmt.Sprintf("%s 40003 1 1 0", node)) // leftover from a larger count
+	write("other-1", fmt.Sprintf("%s 40009 %d %s 0", node, recycled.Process.Pid, procStart(t, recycled.Process.Pid)))
+
+	run := func(slot int, port string) string {
+		cmd := exec.Command("bash", "-c", tunnelRegisterScript("me", slot, 2))
+		cmd.Env = append(os.Environ(), "HOME="+home)
+		cmd.Stdin = strings.NewReader(port + "\n") // then EOF, which ends the held session
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("slot %d: %v\n%s", slot, err, out)
+		}
+		return string(out)
+	}
+	out := run(1, "41001")
+	if want := fmt.Sprintf("registered %s:41001 (killed stale sshd %d)", node, ghost.Process.Pid); !strings.Contains(out, want) {
+		t.Fatalf("want %q, got %q", want, out)
+	}
+	if err := ghost.Wait(); err == nil {
+		t.Fatal("the ghost should have been killed")
+	}
+	rec, _ := os.ReadFile(filepath.Join(dir, "me-1"))
+	f := strings.Fields(string(rec))
+	if len(f) != 5 || f[0] != node || f[1] != "41001" || f[2] != strconv.Itoa(os.Getpid()) || f[3] != procStart(t, os.Getpid()) {
+		t.Fatalf("record should name this connection's parent: %q", rec)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "me-3")); !os.IsNotExist(err) {
+		t.Fatal("slot 3 is above the count and should be gone")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "other-1")); err != nil {
+		t.Fatal("another owner's registration must be left alone")
+	}
+
+	if out := run(2, "41002"); strings.Contains(out, "killed") {
+		t.Fatalf("start time did not match, nothing should be killed: %q", out)
+	}
+	if err := recycled.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("a recycled PID must survive")
+	}
+}
+
+// fakeTunnel answers the relay's probe like Clash does and tags every other
+// line it echoes, so a client can tell which tunnel carried it. A silent one
+// accepts and never answers, like a ghost listener.
+func fakeTunnel(t *testing.T, tag string, silent bool) int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				if silent {
+					time.Sleep(time.Minute)
+					return
+				}
+				r := bufio.NewReader(c)
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.HasPrefix(line, "GET / HTTP/1.0") {
+						c.Write([]byte("HTTP/1.0 400 Bad Request\r\n\r\n"))
+						return
+					}
+					c.Write([]byte(tag + ":" + line))
+				}
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func freePort(t *testing.T) int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// startRelay runs relayScript under a scratch HOME with fast probing, and
+// returns its listen port once it has had time to probe every upstream twice.
+func startRelay(t *testing.T, home string, upPort int) int {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("starts the relay")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local", "share"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(home, "relay.py")
+	os.WriteFile(script, []byte(relayScript), 0755)
+	listen := freePort(t)
+	relay := exec.Command(python, script, strconv.Itoa(upPort), strconv.Itoa(listen), "--log")
+	relay.Env = append(os.Environ(), "HOME="+home, "SPOD_RELAY_TICK=0.2", "SPOD_RELAY_PROBE_TIMEOUT=0.5")
+	var logBuf bytes.Buffer
+	relay.Stdout, relay.Stderr = &logBuf, &logBuf
+	if err := relay.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		relay.Process.Kill()
+		relay.Wait()
+		if t.Failed() {
+			t.Log(logBuf.String())
+		}
+	})
+	time.Sleep(2 * time.Second)
+	return listen
+}
+
+// relayDial sends a line through the relay and returns the tag of the fake
+// tunnel that echoed it.
+func relayDial(t *testing.T, listen int) (net.Conn, string) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", listen), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.Write([]byte("hi\n"))
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatalf("no answer through the relay: %v", err)
+	}
+	return c, strings.SplitN(line, ":", 2)[0]
+}
+
+// Before any `spod tunnel run` has registered, ~/.spod/tunnels does not exist.
+// The relay must still offer the fixed port — the first deploy left every
+// request on SuperPod waiting because it did not.
+func TestRelayUsesLegacyPortWithoutRegistrations(t *testing.T) {
+	home := t.TempDir()
+	listen := startRelay(t, home, fakeTunnel(t, "legacy", false))
+	c, tag := relayDial(t, listen)
+	c.Close()
+	if tag != "legacy" {
+		t.Fatalf("want the legacy tunnel, got %s", tag)
+	}
+}
+
+// The relay balances across registered tunnels, never hands a new connection
+// to one that does not answer, and closes what rides a tunnel whose slot has
+// re-registered elsewhere.
+func TestRelaySpreadsAcrossRegisteredTunnels(t *testing.T) {
+	home := t.TempDir()
+	reg := filepath.Join(home, ".spod", "tunnels")
+	if err := os.MkdirAll(reg, 0755); err != nil {
+		t.Fatal(err)
+	}
+	node, _ := os.Hostname()
+	node = strings.Split(node, ".")[0]
+	register := func(name string, port int) {
+		tmp := filepath.Join(reg, name+".tmp.1")
+		os.WriteFile(tmp, []byte(fmt.Sprintf("%s %d 1 1 0\n", node, port)), 0644)
+		if err := os.Rename(tmp, filepath.Join(reg, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	register("me-1", fakeTunnel(t, "A", false))
+	register("me-2", fakeTunnel(t, "B", false))
+	register("me-3", fakeTunnel(t, "ghost", true))
+	listen := startRelay(t, home, freePort(t))
+	dial := func() (net.Conn, string) { return relayDial(t, listen) }
+	count := map[string]int{}
+	var onA []net.Conn
+	for i := 0; i < 6; i++ {
+		c, tag := dial()
+		defer c.Close()
+		count[tag]++
+		if tag == "A" {
+			onA = append(onA, c)
+		}
+	}
+	if count["A"] != 3 || count["B"] != 3 {
+		t.Fatalf("want 3/3 across A and B and nothing on the ghost, got %v", count)
+	}
+
+	// Slot 1 reconnects elsewhere: what still rides its old port is closed.
+	register("me-1", fakeTunnel(t, "C", false))
+	for _, c := range onA {
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		var ne net.Error
+		if _, err := c.Read(make([]byte, 1)); err == nil || errors.As(err, &ne) && ne.Timeout() {
+			t.Fatalf("a connection on the retired tunnel should have been closed, got %v", err)
+		}
+	}
+	time.Sleep(time.Second)
+	if _, tag := dial(); tag != "C" {
+		t.Fatalf("the new tunnel is the least loaded, want C, got %s", tag)
 	}
 }
 
