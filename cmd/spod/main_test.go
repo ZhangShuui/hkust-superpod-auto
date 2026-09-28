@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,6 +101,50 @@ func TestIsFatalSSHErr(t *testing.T) {
 	retryable := "Connection reset by peer"
 	if isFatalSSHErr(retryable) {
 		t.Errorf("should still be retried: %q", retryable)
+	}
+}
+
+// A running autossh is only replaced on an explicit FREE from a cluster that
+// answered. Killing it on anything less — an outage above all — leaves nothing
+// to rebuild the tunnel once the network is back.
+func TestRunningTunnelActionOnlyRebuildsOnExplicitFree(t *testing.T) {
+	down := errors.New("exit status 255")
+	cases := []struct {
+		name           string
+		stdout, stderr string
+		err            error
+		want           tunnelAction
+	}{
+		{"bound", "BOUND\n", "", nil, tunnelKeep},
+		{"free", "FREE\n", "", nil, tunnelRebuild},
+		{"free after rc noise", "module: command not found\nFREE\n", "", nil, tunnelRebuild},
+		{"network down", "", "ssh: connect to host superpod.ust.hk port 22: Connection timed out", down, tunnelWait},
+		{"rate limited", "", "kex_exchange_identification: read: Connection reset by peer", down, tunnelWait},
+		{"mux hung past deadline", "", "", errors.New("signal: killed"), tunnelWait},
+		{"no ss on the cluster", "UNKNOWN\n", "", nil, tunnelWait},
+		{"empty reply", "", "", nil, tunnelWait},
+		{"login rejected", "", "<itsc-id>@superpod.ust.hk: Permission denied (publickey).", down, tunnelStop},
+	}
+	for _, c := range cases {
+		if got := runningTunnelAction(c.stdout, c.stderr, c.err); got != c.want {
+			t.Errorf("%s: want %d, got %d", c.name, c.want, got)
+		}
+	}
+}
+
+// Between Restart= attempts the unit reads "activating". An autossh started in
+// that window takes the remote port, and every retry of the unit becomes a
+// login that fails ExitOnForwardFailure.
+func TestUnitOwnsTunnelWhileRestarting(t *testing.T) {
+	for _, st := range []string{"active", "activating", "deactivating", "reloading"} {
+		if !unitOwnsTunnel(st) {
+			t.Errorf("%q: the unit still owns the tunnel, spod must not start its own", st)
+		}
+	}
+	for _, st := range []string{"inactive", "failed", "maintenance", ""} {
+		if unitOwnsTunnel(st) {
+			t.Errorf("%q: systemd will not bring it back, spod should manage the tunnel", st)
+		}
 	}
 }
 

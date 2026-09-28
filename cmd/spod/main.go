@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -792,18 +793,97 @@ func resolveTarget(hostname string) []string {
 	return out
 }
 
-// tunnelManagedExternally reports whether a systemd user unit already owns the
-// reverse tunnel. The unit runs a plain `ssh -R`, which the autossh-matching
-// tunnelPIDAndPort() can't see — so without this guard ensureTunnel would spawn
+// tunnelUnitState returns the ActiveState of the systemd user unit that owns
+// this target's reverse tunnel, or "" when SPOD_FORCE_TUNNEL=1 says to manage it
+// here regardless. The unit runs a plain `ssh -R`, which the autossh-matching
+// tunnelPIDAndPort() can't see — so without this check ensureTunnel would spawn
 // a competing autossh that collides on the remote port. On machines without the
-// unit (e.g. a rider colleague's box) is-active != "active" and we fall through
-// to spod's own autossh management. SPOD_FORCE_TUNNEL=1 overrides.
-func tunnelManagedExternally() bool {
+// unit (e.g. a rider colleague's box) it reads "inactive" and we fall through to
+// spod's own autossh management.
+func tunnelUnitState() string {
 	if os.Getenv("SPOD_FORCE_TUNNEL") == "1" {
-		return false
+		return ""
 	}
 	out, _ := exec.Command("systemctl", "--user", "is-active", tgt.unit).Output()
-	return strings.TrimSpace(string(out)) == "active"
+	return strings.TrimSpace(string(out))
+}
+
+// unitOwnsTunnel reports whether a unit in this ActiveState holds the tunnel or
+// is about to take it back. "activating" is the state that matters: between
+// Restart= attempts the unit sits in activating (auto-restart) with the tunnel
+// down, and an autossh started in that window wins the remote port. The unit
+// then fails ExitOnForwardFailure on every retry — a full login each
+// RestartSec, until the cluster starts resetting connections for the whole
+// account. Only a unit systemd will not bring back (inactive, failed,
+// maintenance) leaves the tunnel to us; "deactivating" is how a restart begins,
+// so it counts as owned too.
+func unitOwnsTunnel(state string) bool {
+	switch state {
+	case "active", "activating", "deactivating", "reloading", "refreshing":
+		return true
+	}
+	return false
+}
+
+type tunnelAction int
+
+const (
+	tunnelWait    tunnelAction = iota // no usable answer: leave autossh to retry on its own
+	tunnelKeep                        // the port is bound: the forward is up
+	tunnelRebuild                     // the cluster answered and nothing holds the port
+	tunnelStop                        // the cluster refuses this login: autossh can never succeed
+)
+
+// probeTunnelPort asks the cluster whether our reverse-tunnel port is bound
+// right now, and returns ssh's stdout, stderr and error for runningTunnelAction.
+// It rides the shared mux, so the deadline is load-bearing: a mux whose master
+// sits on a dead connection hangs instead of failing, and ConnectTimeout only
+// covers opening a new connection. Checking the listener rather than proxying
+// a request through it keeps this free of the 1–25 s TLS handshakes this link
+// produces, which would read as "down" and tear a working tunnel apart.
+func probeTunnelPort() (string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	script := fmt.Sprintf(`s=$(ss -ltn 2>/dev/null) || { echo UNKNOWN; exit 0; }; `+
+		`case "$s" in *"127.0.0.1:%s "*) echo BOUND ;; *) echo FREE ;; esac`, tunnelPort)
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, script)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// runningTunnelAction decides what to do about an autossh that is already
+// running. autossh is its own supervisor and restarts ssh whenever it dies, so
+// the only reply that justifies replacing it is an explicit "FREE" from a
+// cluster that answered — then it is sitting out a backoff and a fresh one
+// connects at once. Everything short of that leaves it alone.
+//
+// This used to kill it on any failed `ssh host true`. That probe measures
+// whether the cluster is reachable, not whether the tunnel is, so it fired
+// exactly during network outages: it killed an autossh that was already
+// retrying, the rebuild behind it failed for the same reason the probe had,
+// and once the network was back nothing started a new one — reconnecting
+// sessions never call ensureTunnel again.
+func runningTunnelAction(stdout, stderr string, err error) tunnelAction {
+	if err != nil {
+		if isFatalSSHErr(stderr) {
+			return tunnelStop
+		}
+		return tunnelWait
+	}
+	words := strings.Fields(stdout)
+	if len(words) == 0 {
+		return tunnelWait
+	}
+	switch words[len(words)-1] {
+	case "BOUND":
+		return tunnelKeep
+	case "FREE":
+		return tunnelRebuild
+	}
+	return tunnelWait
 }
 
 func ensureTunnel() {
@@ -823,8 +903,13 @@ func ensureTunnel() {
 
 	ensurePorts()
 
-	if tunnelManagedExternally() {
-		ok(fmt.Sprintf("隧道由 systemd 守护 (%s)，本机不自建", tgt.unit))
+	if st := tunnelUnitState(); unitOwnsTunnel(st) {
+		if st == "active" {
+			ok(fmt.Sprintf("隧道由 systemd 守护 (%s)，本机不自建", tgt.unit))
+		} else {
+			warn(fmt.Sprintf("隧道由 systemd 守护 (%s)，当前 %s（在重连），本机不自建", tgt.unit, st))
+			info(fmt.Sprintf("重连日志: journalctl --user -u %s -n 20", tgt.unit))
+		}
 		return
 	}
 
@@ -855,16 +940,27 @@ func ensureTunnel() {
 
 	pid, _ := tunnelPIDAndPort()
 	if pid > 0 {
-		// PID exists and matches expected port — verify the underlying
-		// SSH connection is still alive
-		probe := exec.Command("ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", host, "true")
-		if err := probe.Run(); err != nil {
-			warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
-			killTunnelPID(pid)
-			time.Sleep(2 * time.Second)
-		} else {
+		// PID exists and matches expected port. Never tear down a tunnel we
+		// could not immediately replace — see runningTunnelAction.
+		stdout, stderr, err := probeTunnelPort()
+		switch runningTunnelAction(stdout, stderr, err) {
+		case tunnelKeep:
 			ok(fmt.Sprintf("隧道运行中 (pid=%d, port=%s)", pid, tunnelPort))
 			return
+		case tunnelWait:
+			warn(fmt.Sprintf("暂时确认不了 %s:%s，隧道进程 (pid=%d) 留给 autossh 自己重连", tgt.label, tunnelPort, pid))
+			return
+		case tunnelStop:
+			warn(fmt.Sprintf("%s 拒绝登录，停掉隧道进程 (pid=%d)：autossh 会一直重试，攒够失败次数会锁账号", tgt.label, pid))
+			killTunnelPID(pid)
+			lines := strings.Split(strings.TrimSpace(stderr), "\n")
+			info(fmt.Sprintf("ssh 报错: %s", lines[len(lines)-1]))
+			info(fmt.Sprintf("修好登录后再跑 %s tunnel", spodCmd()))
+			return
+		case tunnelRebuild:
+			warn(fmt.Sprintf("隧道进程在 (pid=%d)，但 %s:%s 没人监听，重建...", pid, tgt.label, tunnelPort))
+			killTunnelPID(pid)
+			time.Sleep(2 * time.Second)
 		}
 	}
 
